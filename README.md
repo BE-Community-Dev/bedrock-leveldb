@@ -12,6 +12,9 @@ files. Its write APIs are intentionally limited for local tooling: data written
 or flushed by this crate uses the crate's own `BWLDB...` table and manifest
 format, not native LevelDB output for interchange with other engines.
 
+Maintainers and contributors should also read the
+[development guide](docs/DEVELOPMENT.md).
+
 ## Quick Start
 
 ```rust

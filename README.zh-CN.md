@@ -11,6 +11,8 @@ Bedrock 世界数据库。它只处理存储层；区块、实体、玩家、NBT
 `BWLDB...` table/manifest 格式，不是可与其他 LevelDB 引擎互通的 native
 LevelDB 输出。
 
+维护者和贡献者请同时阅读[开发指南](docs/DEVELOPMENT.zh-CN.md)。
+
 ## 快速开始
 
 ```rust
