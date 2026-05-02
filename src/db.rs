@@ -1063,7 +1063,8 @@ impl Db {
         );
         match options.scan_mode {
             ScanMode::Sequential => {
-                for table_number in &inner.manifest.table_numbers {
+                let table_count = inner.manifest.table_numbers.len();
+                for (table_index, table_number) in inner.manifest.table_numbers.iter().enumerate() {
                     check_scan_cancelled(options)?;
                     let table_path = self.root.join(Manifest::table_name(*table_number));
                     if !table_path.exists() {
@@ -1083,6 +1084,16 @@ impl Db {
                     )?;
                     outcome.merge(table_outcome);
                     emit_scan_progress(options, outcome);
+                    log::trace!(
+                        "prefix key scan progress (prefix_len={}, table_index={}, tables={}, visited={}, tables_scanned={}, bytes_read={}, stopped={})",
+                        prefix.len(),
+                        table_index.saturating_add(1),
+                        table_count,
+                        outcome.visited,
+                        outcome.tables_scanned,
+                        outcome.bytes_read,
+                        outcome.stopped
+                    );
                     if outcome.stopped {
                         return Ok(outcome);
                     }
