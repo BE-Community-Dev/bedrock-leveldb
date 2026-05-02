@@ -335,8 +335,17 @@ impl Db {
     where
         F: FnMut(&[u8]) -> Result<VisitorControl> + Send,
     {
+        let started = Instant::now();
         let inner = self.read_inner()?;
-        self.for_each_key_locked(&inner, &options, &mut visitor)
+        log::debug!(
+            "starting key scan (tables={}, scan_mode={:?}, threading={:?})",
+            inner.manifest.table_numbers.len(),
+            options.scan_mode,
+            options.threading
+        );
+        let result = self.for_each_key_locked(&inner, &options, &mut visitor);
+        log_scan_result("key scan", started, &result);
+        result
     }
 
     /// Visits visible key/value entries.
@@ -350,8 +359,17 @@ impl Db {
     where
         F: FnMut(&[u8], &Bytes) -> Result<VisitorControl> + Send,
     {
+        let started = Instant::now();
         let inner = self.read_inner()?;
-        self.for_each_entry_locked(&inner, &options, &mut visitor)
+        log::debug!(
+            "starting entry scan (tables={}, scan_mode={:?}, threading={:?})",
+            inner.manifest.table_numbers.len(),
+            options.scan_mode,
+            options.threading
+        );
+        let result = self.for_each_entry_locked(&inner, &options, &mut visitor);
+        log_scan_result("entry scan", started, &result);
+        result
     }
 
     /// Visits visible key/value entries whose key starts with `prefix`.
@@ -370,8 +388,18 @@ impl Db {
     where
         F: FnMut(&[u8], &Bytes) -> Result<VisitorControl> + Send,
     {
+        let started = Instant::now();
         let inner = self.read_inner()?;
-        self.for_each_prefix_locked(&inner, prefix, &options, &mut visitor)
+        log::debug!(
+            "starting prefix entry scan (prefix_len={}, tables={}, scan_mode={:?}, threading={:?})",
+            prefix.len(),
+            inner.manifest.table_numbers.len(),
+            options.scan_mode,
+            options.threading
+        );
+        let result = self.for_each_prefix_locked(&inner, prefix, &options, &mut visitor);
+        log_scan_result("prefix entry scan", started, &result);
+        result
     }
 
     /// Visits visible keys whose key starts with `prefix` without materializing
@@ -391,8 +419,11 @@ impl Db {
     where
         F: FnMut(&[u8]) -> Result<VisitorControl> + Send,
     {
+        let started = Instant::now();
         let inner = self.read_inner()?;
-        self.for_each_prefix_key_locked(&inner, prefix, &options, &mut visitor)
+        let result = self.for_each_prefix_key_locked(&inner, prefix, &options, &mut visitor);
+        log_scan_result("prefix key scan", started, &result);
+        result
     }
 
     /// Collects visible keys without materializing table values.
@@ -865,7 +896,8 @@ impl Db {
         outcome.worker_threads = 1;
         match options.scan_mode {
             ScanMode::Sequential => {
-                for table_number in &inner.manifest.table_numbers {
+                let table_count = inner.manifest.table_numbers.len();
+                for (table_index, table_number) in inner.manifest.table_numbers.iter().enumerate() {
                     check_scan_cancelled(options)?;
                     let table_path = self.root.join(Manifest::table_name(*table_number));
                     if !table_path.exists() {
@@ -884,6 +916,15 @@ impl Db {
                     )?;
                     outcome.merge(table_outcome);
                     emit_scan_progress(options, outcome);
+                    log::trace!(
+                        "entry scan progress (table_index={}, tables={}, visited={}, tables_scanned={}, bytes_read={}, stopped={})",
+                        table_index.saturating_add(1),
+                        table_count,
+                        outcome.visited,
+                        outcome.tables_scanned,
+                        outcome.bytes_read,
+                        outcome.stopped
+                    );
                     if outcome.stopped {
                         return Ok(outcome);
                     }
@@ -1615,6 +1656,27 @@ fn emit_scan_progress(options: &ReadOptions, outcome: ScanOutcome) {
             visited: outcome.visited,
             bytes_read: outcome.bytes_read,
         });
+    }
+}
+
+fn log_scan_result(operation: &str, started: Instant, result: &Result<ScanOutcome>) {
+    match result {
+        Ok(outcome) => log::debug!(
+            "{operation} complete (visited={}, bytes_read={}, tables_scanned={}, worker_threads={}, queue_wait_ms={}, cancel_checks={}, stopped={}, elapsed_ms={})",
+            outcome.visited,
+            outcome.bytes_read,
+            outcome.tables_scanned,
+            outcome.worker_threads,
+            outcome.queue_wait_ms,
+            outcome.cancel_checks,
+            outcome.stopped,
+            started.elapsed().as_millis()
+        ),
+        Err(error) => log::warn!(
+            "{operation} failed (elapsed_ms={}, error={})",
+            started.elapsed().as_millis(),
+            error
+        ),
     }
 }
 
