@@ -66,6 +66,6 @@ pub use db::{Db, DbStats, PrefixIterator, RawIterator, RepairReport, Snapshot};
 pub use error::{ErrorKind, LevelDbError, Result};
 pub use options::{
     CachePolicy, ChecksumMode, CompressionPolicy, OpenOptions, ReadOptions, ScanCancelFlag,
-    ScanMode, ScanOutcome, ScanProgress, ScanProgressSink, ThreadingOptions, VisitorControl,
-    WriteOptions,
+    ScanMode, ScanOutcome, ScanPipelineOptions, ScanProgress, ScanProgressSink, ThreadingOptions,
+    VisitorControl, WriteOptions,
 };

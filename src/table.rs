@@ -213,7 +213,7 @@ where
         outcome.record(value.len());
         if visitor(key, &value)? == VisitorControl::Stop {
             outcome.stopped = true;
-            return Ok(outcome);
+            return Ok(mark_table_scanned(outcome));
         }
     }
     if !input.is_empty() {
@@ -221,7 +221,7 @@ where
             "table contains trailing bytes".to_string(),
         ));
     }
-    Ok(outcome)
+    Ok(mark_table_scanned(outcome))
 }
 
 pub(crate) fn for_each_table_key<F>(
@@ -276,7 +276,7 @@ where
         outcome.record(value_len);
         if visitor(key)? == VisitorControl::Stop {
             outcome.stopped = true;
-            return Ok(outcome);
+            return Ok(mark_table_scanned(outcome));
         }
     }
     if !input.is_empty() {
@@ -284,7 +284,7 @@ where
             "table contains trailing bytes".to_string(),
         ));
     }
-    Ok(outcome)
+    Ok(mark_table_scanned(outcome))
 }
 
 fn for_each_custom_table_entry_bytes<F>(
@@ -334,7 +334,7 @@ where
         outcome.record(value.len());
         if visitor(key, &value)? == VisitorControl::Stop {
             outcome.stopped = true;
-            return Ok(outcome);
+            return Ok(mark_table_scanned(outcome));
         }
     }
     if !input.is_empty() {
@@ -342,7 +342,7 @@ where
             "table contains trailing bytes".to_string(),
         ));
     }
-    Ok(outcome)
+    Ok(mark_table_scanned(outcome))
 }
 
 pub(crate) fn for_each_table_prefix<F>(
@@ -373,6 +373,37 @@ where
         }
         Ok(VisitorControl::Continue)
     })
+}
+
+pub(crate) fn for_each_table_prefix_key<F>(
+    path: &Path,
+    prefix: &[u8],
+    paranoid_checks: bool,
+    cache: Option<&NativeBlockCache>,
+    visitor: F,
+) -> Result<ScanOutcome>
+where
+    F: FnMut(&[u8]) -> Result<VisitorControl>,
+{
+    if prefix.is_empty() {
+        return for_each_table_key(path, paranoid_checks, cache, visitor);
+    }
+    let Some(bytes) = read_custom_table_bytes(path)? else {
+        log::trace!(
+            "scanning native table prefix keys of {} bytes in {}",
+            prefix.len(),
+            path.display()
+        );
+        return for_each_native_table_prefix_key_seeked(
+            path,
+            prefix,
+            paranoid_checks,
+            cache,
+            visitor,
+        );
+    };
+    log::trace!("scanning custom table prefix keys in {}", path.display());
+    for_each_custom_table_prefix_key_bytes(path, &bytes, prefix, paranoid_checks, visitor)
 }
 
 pub(crate) fn get_table_entry(
@@ -412,6 +443,67 @@ fn decode_entries(payload: &[u8]) -> Result<BTreeMap<Vec<u8>, Bytes>> {
         ));
     }
     Ok(entries)
+}
+
+fn for_each_custom_table_prefix_key_bytes<F>(
+    path: &Path,
+    bytes: &[u8],
+    prefix: &[u8],
+    paranoid_checks: bool,
+    mut visitor: F,
+) -> Result<ScanOutcome>
+where
+    F: FnMut(&[u8]) -> Result<VisitorControl>,
+{
+    let version_offset = TABLE_MAGIC.len();
+    let version = u32::from_le_bytes(
+        bytes[version_offset..version_offset + 4]
+            .try_into()
+            .map_err(|_| LevelDbError::corruption("table version is truncated".to_string()))?,
+    );
+    if version != TABLE_VERSION {
+        return Err(LevelDbError::corruption_at(
+            path,
+            format!("unsupported table version {version}"),
+        ));
+    }
+    let compression_tag = bytes[version_offset + 4];
+    let crc_offset = version_offset + 5;
+    let expected_crc = u32::from_le_bytes(
+        bytes[crc_offset..crc_offset + 4]
+            .try_into()
+            .map_err(|_| LevelDbError::corruption("table crc is truncated".to_string()))?,
+    );
+    let encoded = &bytes[crc_offset + 4..];
+    if paranoid_checks && crate::coding::crc32c(encoded) != expected_crc {
+        return Err(LevelDbError::corruption_at(
+            path,
+            format!("table {} checksum mismatch", path.display()),
+        ));
+    }
+
+    let payload = decompress_payload(compression_tag, encoded)?;
+    let mut input = payload.as_slice();
+    let count = usize::try_from(get_varint32(&mut input)?)
+        .map_err(|_| LevelDbError::corruption("entry count overflow".to_string()))?;
+    let mut outcome = ScanOutcome::empty();
+    for _ in 0..count {
+        let key = get_length_prefixed_slice(&mut input)?;
+        let value_len = get_length_prefixed_slice(&mut input)?.len();
+        if key.starts_with(prefix) {
+            outcome.record(value_len);
+            if visitor(key)? == VisitorControl::Stop {
+                outcome.stopped = true;
+                return Ok(mark_table_scanned(outcome));
+            }
+        }
+    }
+    if !input.is_empty() {
+        return Err(LevelDbError::corruption(
+            "table contains trailing bytes".to_string(),
+        ));
+    }
+    Ok(mark_table_scanned(outcome))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -467,12 +559,12 @@ where
                 outcome.record(value.len());
                 if visitor(user_key, &value)? == VisitorControl::Stop {
                     outcome.stopped = true;
-                    return Ok(outcome);
+                    return Ok(mark_table_scanned(outcome));
                 }
             }
         }
     }
-    Ok(outcome)
+    Ok(mark_table_scanned(outcome))
 }
 
 fn for_each_native_table_key_seeked<F>(
@@ -494,7 +586,7 @@ where
         let data_handle = read_block_handle(&mut handle_input)?;
         let data_block =
             read_native_block_from_file(&mut file, path, data_handle, paranoid_checks, cache)?;
-        for (internal_key, value) in decode_native_block_entries_bytes(&data_block)? {
+        for (internal_key, value_len) in decode_native_block_keys_bytes(&data_block)? {
             let Some((user_key, is_value)) = split_internal_key(&internal_key) else {
                 continue;
             };
@@ -502,15 +594,15 @@ where
                 continue;
             }
             if is_value {
-                outcome.record(value.len());
+                outcome.record(value_len);
                 if visitor(user_key)? == VisitorControl::Stop {
                     outcome.stopped = true;
-                    return Ok(outcome);
+                    return Ok(mark_table_scanned(outcome));
                 }
             }
         }
     }
-    Ok(outcome)
+    Ok(mark_table_scanned(outcome))
 }
 
 fn for_each_native_table_prefix_seeked<F>(
@@ -551,15 +643,64 @@ where
                     outcome.record(value.len());
                     if visitor(user_key, &value)? == VisitorControl::Stop {
                         outcome.stopped = true;
-                        return Ok(outcome);
+                        return Ok(mark_table_scanned(outcome));
                     }
                 }
             } else if user_key > prefix {
-                return Ok(outcome);
+                return Ok(mark_table_scanned(outcome));
             }
         }
     }
-    Ok(outcome)
+    Ok(mark_table_scanned(outcome))
+}
+
+fn for_each_native_table_prefix_key_seeked<F>(
+    path: &Path,
+    prefix: &[u8],
+    paranoid_checks: bool,
+    cache: Option<&NativeBlockCache>,
+    mut visitor: F,
+) -> Result<ScanOutcome>
+where
+    F: FnMut(&[u8]) -> Result<VisitorControl>,
+{
+    let mut file =
+        File::open(path).map_err(|error| LevelDbError::io_at("open native table", path, error))?;
+    let index_entries = read_native_index_entries(&mut file, path, paranoid_checks, cache)?;
+    let mut outcome = ScanOutcome::empty();
+    let mut seen_user_keys = BTreeSet::new();
+    for (index_key, handle_bytes) in index_entries {
+        let Some((largest_key, _)) = split_internal_key(&index_key) else {
+            continue;
+        };
+        if largest_key < prefix {
+            continue;
+        }
+        let mut handle_input = handle_bytes.as_ref();
+        let data_handle = read_block_handle(&mut handle_input)?;
+        let data_block =
+            read_native_block_from_file(&mut file, path, data_handle, paranoid_checks, cache)?;
+        for (internal_key, value_len) in decode_native_block_keys_bytes(&data_block)? {
+            let Some((user_key, is_value)) = split_internal_key(&internal_key) else {
+                continue;
+            };
+            if !seen_user_keys.insert(user_key.to_vec()) {
+                continue;
+            }
+            if user_key.starts_with(prefix) {
+                if is_value {
+                    outcome.record(value_len);
+                    if visitor(user_key)? == VisitorControl::Stop {
+                        outcome.stopped = true;
+                        return Ok(mark_table_scanned(outcome));
+                    }
+                }
+            } else if user_key > prefix {
+                return Ok(mark_table_scanned(outcome));
+            }
+        }
+    }
+    Ok(mark_table_scanned(outcome))
 }
 
 fn get_native_table_entry_seeked(
@@ -880,6 +1021,65 @@ fn decode_native_block_entries_bytes(block: &Bytes) -> Result<Vec<(Vec<u8>, Byte
     }
 
     Ok(entries)
+}
+
+fn decode_native_block_keys_bytes(block: &Bytes) -> Result<Vec<(Vec<u8>, usize)>> {
+    if block.len() < 4 {
+        return Err(LevelDbError::corruption(
+            "native block is missing restart count".to_string(),
+        ));
+    }
+    let restart_count_offset = block.len() - 4;
+    let restart_count = usize::try_from(u32::from_le_bytes(
+        block[restart_count_offset..].try_into().map_err(|_| {
+            LevelDbError::corruption("native block restart count is invalid".to_string())
+        })?,
+    ))
+    .map_err(|_| LevelDbError::corruption("native block restart count overflow".to_string()))?;
+    let restart_bytes = restart_count.checked_mul(4).ok_or_else(|| {
+        LevelDbError::corruption("native block restart array overflow".to_string())
+    })?;
+    if restart_bytes > restart_count_offset {
+        return Err(LevelDbError::corruption(
+            "native block restart array is truncated".to_string(),
+        ));
+    }
+    let entries_end = restart_count_offset - restart_bytes;
+    let mut input = &block[..entries_end];
+    let mut key = Vec::new();
+    let mut entries = Vec::new();
+    while !input.is_empty() {
+        let shared = usize::try_from(get_varint32(&mut input)?).map_err(|_| {
+            LevelDbError::corruption("native block shared key length overflow".to_string())
+        })?;
+        let non_shared = usize::try_from(get_varint32(&mut input)?).map_err(|_| {
+            LevelDbError::corruption("native block key delta length overflow".to_string())
+        })?;
+        let value_len = usize::try_from(get_varint32(&mut input)?).map_err(|_| {
+            LevelDbError::corruption("native block value length overflow".to_string())
+        })?;
+        if shared > key.len() {
+            return Err(LevelDbError::corruption(
+                "native block shared prefix exceeds previous key".to_string(),
+            ));
+        }
+        if input.len() < non_shared.saturating_add(value_len) {
+            return Err(LevelDbError::corruption(
+                "native block entry is truncated".to_string(),
+            ));
+        }
+        key.truncate(shared);
+        key.extend_from_slice(&input[..non_shared]);
+        input = &input[non_shared + value_len..];
+        entries.push((key.clone(), value_len));
+    }
+
+    Ok(entries)
+}
+
+const fn mark_table_scanned(mut outcome: ScanOutcome) -> ScanOutcome {
+    outcome.tables_scanned = outcome.tables_scanned.saturating_add(1);
+    outcome
 }
 
 fn split_internal_key(internal_key: &[u8]) -> Option<(&[u8], bool)> {

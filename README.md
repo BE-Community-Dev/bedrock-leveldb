@@ -19,7 +19,7 @@ Maintainers and contributors should also read the
 
 ```rust
 use bedrock_leveldb::{
-    Db, OpenOptions, ReadOptions, ScanMode, VisitorControl, WriteOptions,
+    Db, OpenOptions, ReadOptions, ScanMode, ScanPipelineOptions, VisitorControl, WriteOptions,
 };
 
 fn main() -> bedrock_leveldb::Result<()> {
@@ -33,6 +33,10 @@ fn main() -> bedrock_leveldb::Result<()> {
         b"player_",
         ReadOptions {
             scan_mode: ScanMode::ParallelTables,
+            pipeline: ScanPipelineOptions {
+                queue_depth: 64,
+                ..ScanPipelineOptions::default()
+            },
             ..ReadOptions::default()
         },
         |key, value| {
@@ -41,7 +45,10 @@ fn main() -> bedrock_leveldb::Result<()> {
         },
     )?;
 
-    println!("visited {} entries", outcome.visited);
+    println!(
+        "visited {} entries across {} tables on {} workers",
+        outcome.visited, outcome.tables_scanned, outcome.worker_threads
+    );
 
     db.put(b"tool_key".as_slice(), b"tool_value".as_slice(), WriteOptions::default())?;
     Ok(())
@@ -78,13 +85,66 @@ repair, flush, or write to the database directory.
   overlay. It does not eagerly materialize every native table value.
 - `Db::get(key)` reads with default options. `Db::get_with(key, ReadOptions)`
   allows per-call checksum and cache policy.
+- With the default `async` feature, `Arc<Db>` now provides owned async read
+  helpers: `get_async`, `get_with_async`, `collect_keys_owned_async`,
+  `collect_prefix_keys_owned_async`, and `collect_prefix_owned_async`. They use
+  Tokio `spawn_blocking` and are intended for GUI or server runtimes that must
+  keep foreground tasks responsive.
+- `Db::collect_keys_owned`, `Db::collect_prefix_keys_owned`, and
+  `Db::collect_prefix_owned` return owned data without forcing callers to write
+  visitor glue for common indexing paths.
+- `ReadOptions::pipeline` configures local Rayon scan scheduling. `queue_depth`,
+  `table_batch_size`, and `progress_interval` use automatic defaults when set to
+  zero. `ScanOutcome` reports `tables_scanned`, `worker_threads`,
+  `queue_wait_ms`, and `cancel_checks` so renderers can tune without fixed
+  machine-specific timing thresholds.
 - `Db::for_each_key`, `Db::for_each_entry`, and `Db::for_each_prefix` stream
   borrowed keys and `Bytes` values to visitors.
+- `Db::for_each_prefix_key` is the preferred render-index path when callers only
+  need keys. It avoids value callbacks and lets native table scans seek directly
+  into the requested prefix range.
 - Visitors return `VisitorControl::Continue` or `VisitorControl::Stop`; normal
   early termination is reported in `ScanOutcome`, not as an error.
 - `stats_fast()` is metadata/overlay-only. `stats_full()`, snapshots,
   materialized iterators, repair, and custom compaction are explicit expensive
   paths.
+
+### Migration: full prefix values to key-only scans
+
+Old render index code often read every chunk value just to discover whether a
+chunk had renderable records:
+
+```rust
+let mut keys = Vec::new();
+db.for_each_prefix(b"chunk-prefix", ReadOptions::default(), |key, _value| {
+    keys.push(bytes::Bytes::copy_from_slice(key));
+    Ok(bedrock_leveldb::VisitorControl::Continue)
+})?;
+```
+
+Prefer the key-only API for viewport and region indexes:
+
+```rust
+let mut keys = Vec::new();
+db.for_each_prefix_key(b"chunk-prefix", ReadOptions::default(), |key| {
+    keys.push(bytes::Bytes::copy_from_slice(key));
+    Ok(bedrock_leveldb::VisitorControl::Continue)
+})?;
+```
+
+Async callers should share the database handle instead of reopening it for each
+request:
+
+```rust
+let db = std::sync::Arc::new(Db::open("path/to/world/db", OpenOptions::default())?);
+let keys = db
+    .clone()
+    .collect_prefix_keys_owned_async(
+        bytes::Bytes::from_static(b"chunk-prefix"),
+        ReadOptions::default(),
+    )
+    .await?;
+```
 
 ## Bedrock Record Helpers
 
@@ -138,7 +198,9 @@ fn main() -> bedrock_leveldb::Result<()> {
 
 Log events are intentionally low-noise and avoid raw values. Useful events are
 emitted around database open, manifest/WAL replay, table scans, custom flushes,
-and repair paths that discard unreadable files.
+repair paths that discard unreadable files, parallel table workers, cancellation,
+and key-only prefix scans. Applications using `tracing` can bridge these events
+with `tracing_log::LogTracer`.
 
 ## Errors
 

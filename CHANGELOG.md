@@ -2,6 +2,44 @@
 
 All notable changes to `bedrock-leveldb` are tracked here.
 
+## 0.2.0 - Unreleased
+
+### Added
+
+- Added key-only prefix scans with `Db::for_each_prefix_key` so render indexes
+  can discover chunk records without materializing unrelated values.
+- Added owned async read helpers for shared handles:
+  `Arc<Db>::get_async`, `Arc<Db>::get_with_async`,
+  `Arc<Db>::collect_keys_owned_async`,
+  `Arc<Db>::collect_prefix_keys_owned_async`, and
+  `Arc<Db>::collect_prefix_owned_async`.
+- Added owned sync collectors: `collect_keys_owned`,
+  `collect_prefix_keys_owned`, and `collect_prefix_owned`.
+- Added `ReadOptions::pipeline` / `ScanPipelineOptions` for bounded queue depth,
+  table batch sizing, and progress cadence in parallel scans.
+- Added `ScanOutcome` diagnostics for `tables_scanned`, `worker_threads`,
+  `queue_wait_ms`, and `cancel_checks`.
+- Added clearer Rayon worker logging around scan start/finish, prefix scans,
+  progress, queue backpressure, and cancellation-sensitive paths through the
+  `log` facade.
+
+### Breaking Changes
+
+- Visitor callbacks used with table-parallel APIs must be `Send` because scans
+  now run on a local Rayon thread pool.
+- Struct literals for `ReadOptions` must set `pipeline` or use
+  `..ReadOptions::default()`.
+
+### Migration Notes
+
+- Render and world callers that previously used `for_each_prefix` only to collect
+  keys should migrate to `for_each_prefix_key`.
+- Async callers should wrap `Db` in `Arc` and use the owned async helpers instead
+  of reopening the database per request.
+- Tune `ScanPipelineOptions` only after looking at `ScanOutcome.queue_wait_ms`
+  and `worker_threads`; the default zero values are automatic and usually best
+  for interactive render indexing.
+
 ## 0.1.0 - 2026-05-01
 
 ### Added

@@ -17,7 +17,7 @@ LevelDB 输出。
 
 ```rust
 use bedrock_leveldb::{
-    Db, OpenOptions, ReadOptions, ScanMode, VisitorControl, WriteOptions,
+    Db, OpenOptions, ReadOptions, ScanMode, ScanPipelineOptions, VisitorControl, WriteOptions,
 };
 
 fn main() -> bedrock_leveldb::Result<()> {
@@ -31,6 +31,10 @@ fn main() -> bedrock_leveldb::Result<()> {
         b"player_",
         ReadOptions {
             scan_mode: ScanMode::ParallelTables,
+            pipeline: ScanPipelineOptions {
+                queue_depth: 64,
+                ..ScanPipelineOptions::default()
+            },
             ..ReadOptions::default()
         },
         |key, value| {
@@ -39,7 +43,10 @@ fn main() -> bedrock_leveldb::Result<()> {
         },
     )?;
 
-    println!("visited {} entries", outcome.visited);
+    println!(
+        "visited {} entries across {} tables on {} workers",
+        outcome.visited, outcome.tables_scanned, outcome.worker_threads
+    );
 
     db.put(b"tool_key".as_slice(), b"tool_value".as_slice(), WriteOptions::default())?;
     Ok(())
@@ -75,12 +82,60 @@ fn main() -> bedrock_leveldb::Result<()> {
   不会急切物化所有 native table value。
 - `Db::get(key)` 使用默认读取选项；`Db::get_with(key, ReadOptions)` 可覆盖
   checksum 和 cache 策略。
+- 默认 `async` feature 下，`Arc<Db>` 提供 owned async 读取接口：
+  `get_async`、`get_with_async`、`collect_keys_owned_async`、
+  `collect_prefix_keys_owned_async` 和 `collect_prefix_owned_async`。这些接口内部使用
+  Tokio `spawn_blocking`，适合 GUI 或服务端 runtime 避免阻塞前台任务。
+- `Db::collect_keys_owned`、`Db::collect_prefix_keys_owned` 和
+  `Db::collect_prefix_owned` 为常见索引路径直接返回 owned 数据，调用方不必手写
+  visitor glue。
+- `ReadOptions::pipeline` 控制本地 Rayon scan 调度。`queue_depth`、
+  `table_batch_size` 和 `progress_interval` 为 0 时自动选择。`ScanOutcome`
+  会报告 `tables_scanned`、`worker_threads`、`queue_wait_ms` 和 `cancel_checks`，
+  便于按统计调优，而不是依赖跨机器固定耗时阈值。
 - `Db::for_each_key`、`Db::for_each_entry`、`Db::for_each_prefix` 以 visitor
   方式流式返回 borrowed key 和 `Bytes` value。
+- `Db::for_each_prefix_key` 是渲染索引推荐路径。只需要 key 时不再回调 value，
+  native table 扫描也会直接 seek 到目标 prefix 范围。
 - visitor 返回 `VisitorControl::Continue` 或 `VisitorControl::Stop`；正常提前
   停止体现在 `ScanOutcome` 中，不作为错误返回。
 - `stats_fast()` 只读取元数据和 overlay；`stats_full()`、snapshot、物化
   iterator、repair、自定义 compact 都是显式昂贵路径。
+
+### 迁移：全量 prefix value 扫描到 key-only scan
+
+旧版渲染索引常常为了判断 chunk 是否有可渲染记录而读取 value：
+
+```rust
+let mut keys = Vec::new();
+db.for_each_prefix(b"chunk-prefix", ReadOptions::default(), |key, _value| {
+    keys.push(bytes::Bytes::copy_from_slice(key));
+    Ok(bedrock_leveldb::VisitorControl::Continue)
+})?;
+```
+
+现在应优先使用 key-only API：
+
+```rust
+let mut keys = Vec::new();
+db.for_each_prefix_key(b"chunk-prefix", ReadOptions::default(), |key| {
+    keys.push(bytes::Bytes::copy_from_slice(key));
+    Ok(bedrock_leveldb::VisitorControl::Continue)
+})?;
+```
+
+异步调用方应复用同一个数据库句柄，而不是每个请求重新 open：
+
+```rust
+let db = std::sync::Arc::new(Db::open("path/to/world/db", OpenOptions::default())?);
+let keys = db
+    .clone()
+    .collect_prefix_keys_owned_async(
+        bytes::Bytes::from_static(b"chunk-prefix"),
+        ReadOptions::default(),
+    )
+    .await?;
+```
 
 ## Bedrock 记录辅助解析
 
@@ -131,7 +186,9 @@ fn main() -> bedrock_leveldb::Result<()> {
 ```
 
 日志事件保持低噪声，不记录 raw value。当前主要覆盖数据库打开、manifest/WAL
-replay、table scan、自定义 flush，以及 repair 丢弃不可读文件等路径。
+replay、table scan、自定义 flush、repair 丢弃不可读文件、并行 worker、取消和
+key-only prefix scan。使用 `tracing` 的应用可以通过 `tracing_log::LogTracer`
+接入这些日志。
 
 ## 错误处理
 

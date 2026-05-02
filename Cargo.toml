@@ -43,6 +43,7 @@ bytes = "1.10.1"
 flate2 = { version = "1.1.5", default-features = false, features = ["rust_backend"], optional = true }
 log = "0.4"
 memmap2 = { version = "0.9.9", optional = true }
+rayon = "1.11.0"
 snap = { version = "1.1.1", optional = true }
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["rt", "sync"], optional = true }

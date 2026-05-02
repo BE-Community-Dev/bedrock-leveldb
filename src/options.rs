@@ -61,6 +61,8 @@ pub struct ReadOptions {
     pub threading: ThreadingOptions,
     /// Sequential or table-parallel scan execution.
     pub scan_mode: ScanMode,
+    /// Bounded scan pipeline behavior for parallel scans and progress cadence.
+    pub pipeline: ScanPipelineOptions,
     /// Optional cooperative cancellation flag checked during scans.
     pub cancel: Option<ScanCancelFlag>,
     /// Optional progress callback emitted during scans.
@@ -74,10 +76,26 @@ impl Default for ReadOptions {
             cache_policy: CachePolicy::Use,
             threading: ThreadingOptions::Auto,
             scan_mode: ScanMode::Sequential,
+            pipeline: ScanPipelineOptions::default(),
             cancel: None,
             progress: None,
         }
     }
+}
+
+/// Bounded pipeline policy used by table scans.
+///
+/// A zero value chooses an automatic default based on worker count and table
+/// count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanPipelineOptions {
+    /// Maximum number of queued scan messages before worker threads apply
+    /// backpressure.
+    pub queue_depth: usize,
+    /// Number of table files assigned to one Rayon work item.
+    pub table_batch_size: usize,
+    /// Emit progress after this many visited records.
+    pub progress_interval: usize,
 }
 
 /// Options used when writing to the overlay and WAL.
@@ -152,6 +170,14 @@ pub struct ScanOutcome {
     pub bytes_read: usize,
     /// Whether the visitor stopped the scan.
     pub stopped: bool,
+    /// Number of table files that were opened and scanned.
+    pub tables_scanned: usize,
+    /// Number of worker threads used by the scan.
+    pub worker_threads: usize,
+    /// Milliseconds workers spent waiting for bounded scan queues.
+    pub queue_wait_ms: u128,
+    /// Number of cooperative cancellation checks performed by the scan.
+    pub cancel_checks: usize,
 }
 
 impl ScanOutcome {
@@ -162,6 +188,10 @@ impl ScanOutcome {
             visited: 0,
             bytes_read: 0,
             stopped: false,
+            tables_scanned: 0,
+            worker_threads: 0,
+            queue_wait_ms: 0,
+            cancel_checks: 0,
         }
     }
 
@@ -176,6 +206,10 @@ impl ScanOutcome {
         self.visited = self.visited.saturating_add(other.visited);
         self.bytes_read = self.bytes_read.saturating_add(other.bytes_read);
         self.stopped |= other.stopped;
+        self.tables_scanned = self.tables_scanned.saturating_add(other.tables_scanned);
+        self.worker_threads = self.worker_threads.max(other.worker_threads);
+        self.queue_wait_ms = self.queue_wait_ms.saturating_add(other.queue_wait_ms);
+        self.cancel_checks = self.cancel_checks.saturating_add(other.cancel_checks);
     }
 }
 
@@ -205,6 +239,39 @@ impl ScanCancelFlag {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl ScanPipelineOptions {
+    /// Resolves the bounded queue depth for a scan.
+    #[must_use]
+    pub fn resolve_queue_depth(self, workers: usize, tables: usize) -> usize {
+        self.queue_depth
+            .max(if self.queue_depth == 0 {
+                workers.max(1).saturating_mul(256).max(tables.max(1))
+            } else {
+                1
+            })
+            .max(1)
+    }
+
+    /// Resolves the table batch size for one Rayon task.
+    #[must_use]
+    pub fn resolve_table_batch_size(self, workers: usize, tables: usize) -> usize {
+        self.table_batch_size
+            .max(if self.table_batch_size == 0 {
+                tables.div_ceil(workers.max(1).saturating_mul(2)).max(1)
+            } else {
+                1
+            })
+            .max(1)
+    }
+
+    /// Resolves the progress emission interval.
+    #[must_use]
+    pub fn resolve_progress_interval(self) -> usize {
+        self.progress_interval
+            .max(if self.progress_interval == 0 { 8192 } else { 1 })
     }
 }
 
@@ -313,5 +380,23 @@ mod tests {
                 .resolve_checked(10)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn scan_pipeline_options_resolve_automatic_bounds() {
+        let options = ScanPipelineOptions::default();
+
+        assert!(options.resolve_queue_depth(4, 128) >= 1);
+        assert!(options.resolve_table_batch_size(4, 128) >= 1);
+        assert_eq!(options.resolve_progress_interval(), 8192);
+
+        let explicit = ScanPipelineOptions {
+            queue_depth: 7,
+            table_batch_size: 3,
+            progress_interval: 11,
+        };
+        assert_eq!(explicit.resolve_queue_depth(4, 128), 7);
+        assert_eq!(explicit.resolve_table_batch_size(4, 128), 3);
+        assert_eq!(explicit.resolve_progress_interval(), 11);
     }
 }

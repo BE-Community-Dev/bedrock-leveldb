@@ -8,6 +8,7 @@ use crate::options::{
 use crate::table;
 use crate::wal;
 use bytes::Bytes;
+use rayon::ThreadPoolBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -17,7 +18,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
-use std::thread;
+use std::time::Instant;
 
 /// Fast or full database statistics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +186,36 @@ impl Db {
             .map_err(|error| LevelDbError::join(error.to_string()))?
     }
 
+    #[cfg(feature = "async")]
+    /// Reads a key on a blocking Tokio task using an owned [`Arc<Db>`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Db::get`] plus a join error if the blocking
+    /// task fails to complete.
+    pub async fn get_async(self: Arc<Self>, key: Bytes) -> Result<Option<Bytes>> {
+        tokio::task::spawn_blocking(move || self.get(&key))
+            .await
+            .map_err(|error| LevelDbError::join(error.to_string()))?
+    }
+
+    #[cfg(feature = "async")]
+    /// Reads a key on a blocking Tokio task using explicit [`ReadOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Db::get_with`] plus a join error if the
+    /// blocking task fails to complete.
+    pub async fn get_with_async(
+        self: Arc<Self>,
+        key: Bytes,
+        options: ReadOptions,
+    ) -> Result<Option<Bytes>> {
+        tokio::task::spawn_blocking(move || self.get_with(&key, options))
+            .await
+            .map_err(|error| LevelDbError::join(error.to_string()))?
+    }
+
     /// Reads a key using default [`ReadOptions`].
     ///
     /// # Errors
@@ -302,7 +333,7 @@ impl Db {
     /// are invalid, or the visitor returns an error.
     pub fn for_each_key<F>(&self, options: ReadOptions, mut visitor: F) -> Result<ScanOutcome>
     where
-        F: FnMut(&[u8]) -> Result<VisitorControl>,
+        F: FnMut(&[u8]) -> Result<VisitorControl> + Send,
     {
         let inner = self.read_inner()?;
         self.for_each_key_locked(&inner, &options, &mut visitor)
@@ -317,7 +348,7 @@ impl Db {
     /// are invalid, or the visitor returns an error.
     pub fn for_each_entry<F>(&self, options: ReadOptions, mut visitor: F) -> Result<ScanOutcome>
     where
-        F: FnMut(&[u8], &Bytes) -> Result<VisitorControl>,
+        F: FnMut(&[u8], &Bytes) -> Result<VisitorControl> + Send,
     {
         let inner = self.read_inner()?;
         self.for_each_entry_locked(&inner, &options, &mut visitor)
@@ -337,10 +368,146 @@ impl Db {
         mut visitor: F,
     ) -> Result<ScanOutcome>
     where
-        F: FnMut(&[u8], &Bytes) -> Result<VisitorControl>,
+        F: FnMut(&[u8], &Bytes) -> Result<VisitorControl> + Send,
     {
         let inner = self.read_inner()?;
         self.for_each_prefix_locked(&inner, prefix, &options, &mut visitor)
+    }
+
+    /// Visits visible keys whose key starts with `prefix` without materializing
+    /// table values for the visitor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when scan cancellation is requested, an underlying table
+    /// cannot be read, checksum or compression validation fails, thread options
+    /// are invalid, or the visitor returns an error.
+    pub fn for_each_prefix_key<F>(
+        &self,
+        prefix: &[u8],
+        options: ReadOptions,
+        mut visitor: F,
+    ) -> Result<ScanOutcome>
+    where
+        F: FnMut(&[u8]) -> Result<VisitorControl> + Send,
+    {
+        let inner = self.read_inner()?;
+        self.for_each_prefix_key_locked(&inner, prefix, &options, &mut visitor)
+    }
+
+    /// Collects visible keys without materializing table values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key scan fails or is cancelled.
+    pub fn collect_keys_owned(&self, options: ReadOptions) -> Result<Vec<Bytes>> {
+        let mut keys = Vec::new();
+        self.for_each_key(options, |key| {
+            keys.push(Bytes::copy_from_slice(key));
+            Ok(VisitorControl::Continue)
+        })?;
+        Ok(keys)
+    }
+
+    /// Collects visible keys whose key starts with `prefix` without
+    /// materializing table values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key scan fails or is cancelled.
+    pub fn collect_prefix_keys_owned(
+        &self,
+        prefix: &[u8],
+        options: ReadOptions,
+    ) -> Result<Vec<Bytes>> {
+        let mut keys = Vec::new();
+        self.for_each_prefix_key(prefix, options, |key| {
+            keys.push(Bytes::copy_from_slice(key));
+            Ok(VisitorControl::Continue)
+        })?;
+        Ok(keys)
+    }
+
+    /// Collects visible key/value entries whose key starts with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or is cancelled.
+    pub fn collect_prefix_owned(
+        &self,
+        prefix: &[u8],
+        options: ReadOptions,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        let mut entries = Vec::new();
+        self.for_each_prefix(prefix, options, |key, value| {
+            entries.push((Bytes::copy_from_slice(key), value.clone()));
+            Ok(VisitorControl::Continue)
+        })?;
+        Ok(entries)
+    }
+
+    #[cfg(feature = "async")]
+    /// Collects visible keys on a blocking Tokio task.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Db::collect_keys_owned`] plus a join error.
+    pub async fn collect_keys_owned_async(
+        self: Arc<Self>,
+        options: ReadOptions,
+    ) -> Result<Vec<Bytes>> {
+        tokio::task::spawn_blocking(move || self.collect_keys_owned(options))
+            .await
+            .map_err(|error| LevelDbError::join(error.to_string()))?
+    }
+
+    #[cfg(feature = "async")]
+    /// Collects visible prefix keys on a blocking Tokio task.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Db::collect_prefix_keys_owned`] plus a join
+    /// error.
+    pub async fn collect_prefix_keys_owned_async(
+        self: Arc<Self>,
+        prefix: Bytes,
+        options: ReadOptions,
+    ) -> Result<Vec<Bytes>> {
+        tokio::task::spawn_blocking(move || self.collect_prefix_keys_owned(&prefix, options))
+            .await
+            .map_err(|error| LevelDbError::join(error.to_string()))?
+    }
+
+    #[cfg(feature = "async")]
+    /// Collects visible prefix entries on a blocking Tokio task.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Db::collect_prefix_owned`] plus a join
+    /// error.
+    pub async fn collect_prefix_owned_async(
+        self: Arc<Self>,
+        prefix: Bytes,
+        options: ReadOptions,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        tokio::task::spawn_blocking(move || self.collect_prefix_owned(&prefix, options))
+            .await
+            .map_err(|error| LevelDbError::join(error.to_string()))?
+    }
+
+    #[cfg(feature = "async")]
+    /// Collects visible keys with `prefix` on a blocking Tokio task.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Db::for_each_prefix_key`] plus a join error
+    /// if the blocking task fails to complete.
+    pub async fn prefix_keys_async(
+        self: Arc<Self>,
+        prefix: Bytes,
+        options: ReadOptions,
+    ) -> Result<Vec<Bytes>> {
+        self.collect_prefix_keys_owned_async(prefix, options).await
     }
 
     /// Visits keys with per-worker local state for table-parallel reductions.
@@ -690,11 +857,12 @@ impl Db {
         visitor: &mut F,
     ) -> Result<ScanOutcome>
     where
-        F: FnMut(&[u8], &Bytes) -> Result<VisitorControl>,
+        F: FnMut(&[u8], &Bytes) -> Result<VisitorControl> + Send,
     {
         let hidden_keys = inner.overlay.keys().cloned().collect::<BTreeSet<_>>();
         let verify_checksums = read_checksums(&self.options, options);
         let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = 1;
         match options.scan_mode {
             ScanMode::Sequential => {
                 for table_number in &inner.manifest.table_numbers {
@@ -762,11 +930,12 @@ impl Db {
         visitor: &mut F,
     ) -> Result<ScanOutcome>
     where
-        F: FnMut(&[u8], &Bytes) -> Result<VisitorControl>,
+        F: FnMut(&[u8], &Bytes) -> Result<VisitorControl> + Send,
     {
         let hidden_keys = inner.overlay.keys().cloned().collect::<BTreeSet<_>>();
         let verify_checksums = read_checksums(&self.options, options);
         let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = 1;
         match options.scan_mode {
             ScanMode::Sequential => {
                 for table_number in &inner.manifest.table_numbers {
@@ -831,6 +1000,90 @@ impl Db {
         Ok(outcome)
     }
 
+    fn for_each_prefix_key_locked<F>(
+        &self,
+        inner: &DbInner,
+        prefix: &[u8],
+        options: &ReadOptions,
+        visitor: &mut F,
+    ) -> Result<ScanOutcome>
+    where
+        F: FnMut(&[u8]) -> Result<VisitorControl> + Send,
+    {
+        let hidden_keys = inner.overlay.keys().cloned().collect::<BTreeSet<_>>();
+        let verify_checksums = read_checksums(&self.options, options);
+        let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = 1;
+        log::debug!(
+            "starting prefix key scan (prefix_len={}, tables={}, scan_mode={:?})",
+            prefix.len(),
+            inner.manifest.table_numbers.len(),
+            options.scan_mode
+        );
+        match options.scan_mode {
+            ScanMode::Sequential => {
+                for table_number in &inner.manifest.table_numbers {
+                    check_scan_cancelled(options)?;
+                    let table_path = self.root.join(Manifest::table_name(*table_number));
+                    if !table_path.exists() {
+                        continue;
+                    }
+                    let table_outcome = table::for_each_table_prefix_key(
+                        &table_path,
+                        prefix,
+                        verify_checksums,
+                        read_cache(options, &self.block_cache),
+                        |key| {
+                            if !hidden_keys.contains(key) {
+                                return visitor(key);
+                            }
+                            Ok(VisitorControl::Continue)
+                        },
+                    )?;
+                    outcome.merge(table_outcome);
+                    emit_scan_progress(options, outcome);
+                    if outcome.stopped {
+                        return Ok(outcome);
+                    }
+                }
+            }
+            ScanMode::ParallelTables => {
+                let table_paths = table_paths(&self.root, &inner.manifest);
+                let table_outcome = for_each_table_prefix_key_paths_parallel(
+                    table_paths,
+                    prefix.to_vec(),
+                    verify_checksums,
+                    read_cache(options, &self.block_cache),
+                    options
+                        .threading
+                        .resolve_checked(inner.manifest.table_numbers.len())?,
+                    hidden_keys,
+                    visitor,
+                    options,
+                )?;
+                outcome.merge(table_outcome);
+                if outcome.stopped {
+                    return Ok(outcome);
+                }
+            }
+        }
+        for (key, value) in inner
+            .overlay
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            check_scan_cancelled(options)?;
+            if let Some(value) = value {
+                outcome.record(value.len());
+                if visitor(key)? == VisitorControl::Stop {
+                    outcome.stopped = true;
+                    return Ok(outcome);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
     fn for_each_key_locked<F>(
         &self,
         inner: &DbInner,
@@ -838,11 +1091,12 @@ impl Db {
         visitor: &mut F,
     ) -> Result<ScanOutcome>
     where
-        F: FnMut(&[u8]) -> Result<VisitorControl>,
+        F: FnMut(&[u8]) -> Result<VisitorControl> + Send,
     {
         let hidden_keys = inner.overlay.keys().cloned().collect::<BTreeSet<_>>();
         let verify_checksums = read_checksums(&self.options, options);
         let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = 1;
         match options.scan_mode {
             ScanMode::Sequential => {
                 for table_number in &inner.manifest.table_numbers {
@@ -917,6 +1171,7 @@ impl Db {
         let verify_checksums = read_checksums(&self.options, options);
         let mut partitions = Vec::new();
         let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = 1;
         match options.scan_mode {
             ScanMode::Sequential => {
                 let mut partition = init();
@@ -997,6 +1252,7 @@ impl Db {
         let verify_checksums = read_checksums(&self.options, options);
         let mut partitions = Vec::new();
         let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = 1;
         match options.scan_mode {
             ScanMode::Sequential => {
                 let mut partition = init();
@@ -1362,6 +1618,45 @@ fn emit_scan_progress(options: &ReadOptions, outcome: ScanOutcome) {
     }
 }
 
+fn should_emit_scan_progress(options: &ReadOptions, visited: usize) -> bool {
+    visited.is_multiple_of(options.pipeline.resolve_progress_interval())
+}
+
+fn scan_pool(worker_count: usize) -> Result<rayon::ThreadPool> {
+    ThreadPoolBuilder::new()
+        .num_threads(worker_count.max(1).saturating_add(1))
+        .thread_name(|index| format!("bedrock-leveldb-scan-{index}"))
+        .build()
+        .map_err(|error| {
+            LevelDbError::invalid_argument(format!("failed to build scan worker pool: {error}"))
+        })
+}
+
+fn send_with_wait<T>(
+    sender: &mpsc::SyncSender<T>,
+    message: T,
+    queue_wait_ms: &std::sync::atomic::AtomicU64,
+) -> bool {
+    let started = Instant::now();
+    let result = sender.send(message);
+    let waited = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    queue_wait_ms.fetch_add(waited, Ordering::Relaxed);
+    result.is_ok()
+}
+
+fn parallel_queue_depth(options: &ReadOptions, workers: usize, tables: usize) -> usize {
+    options.pipeline.resolve_queue_depth(workers, tables)
+}
+
+fn merge_parallel_worker_metadata(outcome: &mut ScanOutcome, worker: ScanOutcome) {
+    outcome.bytes_read = outcome.bytes_read.saturating_add(worker.bytes_read);
+    outcome.tables_scanned = outcome.tables_scanned.saturating_add(worker.tables_scanned);
+    outcome.worker_threads = outcome.worker_threads.max(worker.worker_threads);
+    outcome.queue_wait_ms = outcome.queue_wait_ms.saturating_add(worker.queue_wait_ms);
+    outcome.cancel_checks = outcome.cancel_checks.saturating_add(worker.cancel_checks);
+    outcome.stopped |= worker.stopped;
+}
+
 fn allocate_file_number(manifest: &mut Manifest) -> u64 {
     let number = manifest.next_file_number;
     manifest.next_file_number = manifest.next_file_number.saturating_add(1);
@@ -1435,7 +1730,7 @@ fn for_each_table_paths_parallel<F>(
     options: &ReadOptions,
 ) -> Result<ScanOutcome>
 where
-    F: FnMut(&[u8], &Bytes) -> Result<VisitorControl>,
+    F: FnMut(&[u8], &Bytes) -> Result<VisitorControl> + Send,
 {
     enum TableMessage {
         Entry(Vec<u8>, Bytes),
@@ -1447,19 +1742,23 @@ where
         return Ok(ScanOutcome::empty());
     }
     let worker_count = threads.max(1).min(table_paths.len());
+    let queue_depth = parallel_queue_depth(options, worker_count, table_paths.len());
     let worker_paths = partition_paths_by_size(table_paths, worker_count);
 
     let hidden_keys = Arc::new(hidden_keys);
     let cancelled = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = mpsc::sync_channel::<TableMessage>(4096);
+    let queue_wait_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (sender, receiver) = mpsc::sync_channel::<TableMessage>(queue_depth);
+    let pool = scan_pool(worker_count)?;
 
-    thread::scope(|scope| {
+    pool.scope(|scope| {
         for paths in worker_paths {
             let sender = sender.clone();
             let prefix = prefix.clone();
             let hidden_keys = hidden_keys.clone();
             let cancelled = cancelled.clone();
-            scope.spawn(move || {
+            let queue_wait_ms = Arc::clone(&queue_wait_ms);
+            scope.spawn(move |_| {
                 for path in paths {
                     if cancelled.load(Ordering::Relaxed) {
                         return;
@@ -1472,9 +1771,11 @@ where
                             cache,
                             |key, value| {
                                 if !hidden_keys.contains(key)
-                                    && sender
-                                        .send(TableMessage::Entry(key.to_vec(), value.clone()))
-                                        .is_err()
+                                    && !send_with_wait(
+                                        &sender,
+                                        TableMessage::Entry(key.to_vec(), value.clone()),
+                                        &queue_wait_ms,
+                                    )
                                 {
                                     cancelled.store(true, Ordering::Relaxed);
                                 }
@@ -1484,9 +1785,11 @@ where
                     } else {
                         table::for_each_table_entry(&path, verify_checksums, cache, |key, value| {
                             if !hidden_keys.contains(key)
-                                && sender
-                                    .send(TableMessage::Entry(key.to_vec(), value.clone()))
-                                    .is_err()
+                                && !send_with_wait(
+                                    &sender,
+                                    TableMessage::Entry(key.to_vec(), value.clone()),
+                                    &queue_wait_ms,
+                                )
                             {
                                 cancelled.store(true, Ordering::Relaxed);
                             }
@@ -1495,10 +1798,21 @@ where
                     };
                     match scan_result {
                         Ok(outcome) => {
-                            let _ = sender.send(TableMessage::Outcome(outcome));
+                            if !send_with_wait(
+                                &sender,
+                                TableMessage::Outcome(outcome),
+                                &queue_wait_ms,
+                            ) {
+                                cancelled.store(true, Ordering::Relaxed);
+                                return;
+                            }
                         }
                         Err(error) => {
-                            let _ = sender.send(TableMessage::Error(error));
+                            if !send_with_wait(&sender, TableMessage::Error(error), &queue_wait_ms)
+                            {
+                                cancelled.store(true, Ordering::Relaxed);
+                                return;
+                            }
                             cancelled.store(true, Ordering::Relaxed);
                             return;
                         }
@@ -1509,7 +1823,9 @@ where
         drop(sender);
 
         let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = worker_count;
         for message in receiver {
+            outcome.cancel_checks = outcome.cancel_checks.saturating_add(1);
             match message {
                 TableMessage::Entry(key, value) => {
                     check_scan_cancelled(options)?;
@@ -1519,15 +1835,18 @@ where
                         VisitorControl::Stop => {
                             outcome.stopped = true;
                             cancelled.store(true, Ordering::Relaxed);
+                            outcome.queue_wait_ms = outcome
+                                .queue_wait_ms
+                                .saturating_add(u128::from(queue_wait_ms.load(Ordering::Relaxed)));
                             return Ok(outcome);
                         }
                     }
-                    if outcome.visited.is_multiple_of(8192) {
+                    if should_emit_scan_progress(options, outcome.visited) {
                         emit_scan_progress(options, outcome);
                     }
                 }
                 TableMessage::Outcome(worker_outcome) => {
-                    outcome.bytes_read = outcome.bytes_read.max(worker_outcome.bytes_read);
+                    merge_parallel_worker_metadata(&mut outcome, worker_outcome);
                 }
                 TableMessage::Error(error) => {
                     cancelled.store(true, Ordering::Relaxed);
@@ -1535,6 +1854,9 @@ where
                 }
             }
         }
+        outcome.queue_wait_ms = outcome
+            .queue_wait_ms
+            .saturating_add(u128::from(queue_wait_ms.load(Ordering::Relaxed)));
         Ok(outcome)
     })
 }
@@ -1549,7 +1871,7 @@ fn for_each_table_key_paths_parallel<F>(
     options: &ReadOptions,
 ) -> Result<ScanOutcome>
 where
-    F: FnMut(&[u8]) -> Result<VisitorControl>,
+    F: FnMut(&[u8]) -> Result<VisitorControl> + Send,
 {
     enum TableMessage {
         Key(Vec<u8>),
@@ -1561,18 +1883,22 @@ where
         return Ok(ScanOutcome::empty());
     }
     let worker_count = threads.max(1).min(table_paths.len());
+    let queue_depth = parallel_queue_depth(options, worker_count, table_paths.len());
     let worker_paths = partition_paths_by_size(table_paths, worker_count);
 
     let hidden_keys = Arc::new(hidden_keys);
     let cancelled = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = mpsc::sync_channel::<TableMessage>(4096);
+    let queue_wait_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (sender, receiver) = mpsc::sync_channel::<TableMessage>(queue_depth);
+    let pool = scan_pool(worker_count)?;
 
-    thread::scope(|scope| {
+    pool.scope(|scope| {
         for paths in worker_paths {
             let sender = sender.clone();
             let hidden_keys = hidden_keys.clone();
             let cancelled = cancelled.clone();
-            scope.spawn(move || {
+            let queue_wait_ms = Arc::clone(&queue_wait_ms);
+            scope.spawn(move |_| {
                 for path in paths {
                     if cancelled.load(Ordering::Relaxed) {
                         return;
@@ -1580,7 +1906,11 @@ where
                     let scan_result =
                         table::for_each_table_key(&path, verify_checksums, cache, |key| {
                             if !hidden_keys.contains(key)
-                                && sender.send(TableMessage::Key(key.to_vec())).is_err()
+                                && !send_with_wait(
+                                    &sender,
+                                    TableMessage::Key(key.to_vec()),
+                                    &queue_wait_ms,
+                                )
                             {
                                 cancelled.store(true, Ordering::Relaxed);
                             }
@@ -1588,10 +1918,18 @@ where
                         });
                     match scan_result {
                         Ok(outcome) => {
-                            let _ = sender.send(TableMessage::Outcome(outcome));
+                            if !send_with_wait(
+                                &sender,
+                                TableMessage::Outcome(outcome),
+                                &queue_wait_ms,
+                            ) {
+                                cancelled.store(true, Ordering::Relaxed);
+                                return;
+                            }
                         }
                         Err(error) => {
-                            let _ = sender.send(TableMessage::Error(error));
+                            let _ =
+                                send_with_wait(&sender, TableMessage::Error(error), &queue_wait_ms);
                             cancelled.store(true, Ordering::Relaxed);
                             return;
                         }
@@ -1602,7 +1940,9 @@ where
         drop(sender);
 
         let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = worker_count;
         for message in receiver {
+            outcome.cancel_checks = outcome.cancel_checks.saturating_add(1);
             match message {
                 TableMessage::Key(key) => {
                     check_scan_cancelled(options)?;
@@ -1610,14 +1950,17 @@ where
                     if visitor(&key)? == VisitorControl::Stop {
                         outcome.stopped = true;
                         cancelled.store(true, Ordering::Relaxed);
+                        outcome.queue_wait_ms = outcome
+                            .queue_wait_ms
+                            .saturating_add(u128::from(queue_wait_ms.load(Ordering::Relaxed)));
                         return Ok(outcome);
                     }
-                    if outcome.visited.is_multiple_of(8192) {
+                    if should_emit_scan_progress(options, outcome.visited) {
                         emit_scan_progress(options, outcome);
                     }
                 }
                 TableMessage::Outcome(worker_outcome) => {
-                    outcome.bytes_read = outcome.bytes_read.max(worker_outcome.bytes_read);
+                    merge_parallel_worker_metadata(&mut outcome, worker_outcome);
                 }
                 TableMessage::Error(error) => {
                     cancelled.store(true, Ordering::Relaxed);
@@ -1625,6 +1968,144 @@ where
                 }
             }
         }
+        outcome.queue_wait_ms = outcome
+            .queue_wait_ms
+            .saturating_add(u128::from(queue_wait_ms.load(Ordering::Relaxed)));
+        Ok(outcome)
+    })
+}
+
+fn for_each_table_prefix_key_paths_parallel<F>(
+    table_paths: Vec<PathBuf>,
+    prefix: Vec<u8>,
+    verify_checksums: bool,
+    cache: Option<&table::NativeBlockCache>,
+    threads: usize,
+    hidden_keys: BTreeSet<Vec<u8>>,
+    visitor: &mut F,
+    options: &ReadOptions,
+) -> Result<ScanOutcome>
+where
+    F: FnMut(&[u8]) -> Result<VisitorControl> + Send,
+{
+    enum TableMessage {
+        Key(Vec<u8>),
+        Error(LevelDbError),
+        Outcome(ScanOutcome),
+    }
+
+    if table_paths.is_empty() {
+        return Ok(ScanOutcome::empty());
+    }
+    let worker_count = threads.max(1).min(table_paths.len());
+    let queue_depth = parallel_queue_depth(options, worker_count, table_paths.len());
+    let worker_paths = partition_paths_by_size(table_paths, worker_count);
+
+    log::debug!(
+        "starting parallel prefix key scan (workers={}, prefix_len={})",
+        worker_count,
+        prefix.len()
+    );
+
+    let prefix = Arc::new(prefix);
+    let hidden_keys = Arc::new(hidden_keys);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let queue_wait_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (sender, receiver) = mpsc::sync_channel::<TableMessage>(queue_depth);
+    let pool = scan_pool(worker_count)?;
+
+    pool.scope(|scope| {
+        for (worker_index, paths) in worker_paths.into_iter().enumerate() {
+            let sender = sender.clone();
+            let prefix = prefix.clone();
+            let hidden_keys = hidden_keys.clone();
+            let cancelled = cancelled.clone();
+            let queue_wait_ms = Arc::clone(&queue_wait_ms);
+            scope.spawn(move |_| {
+                log::trace!(
+                    "prefix key scan worker {} started with {} table(s)",
+                    worker_index,
+                    paths.len()
+                );
+                for path in paths {
+                    if cancelled.load(Ordering::Relaxed) {
+                        log::trace!("prefix key scan worker {} cancelled", worker_index);
+                        return;
+                    }
+                    let scan_result = table::for_each_table_prefix_key(
+                        &path,
+                        &prefix,
+                        verify_checksums,
+                        cache,
+                        |key| {
+                            if !hidden_keys.contains(key)
+                                && !send_with_wait(
+                                    &sender,
+                                    TableMessage::Key(key.to_vec()),
+                                    &queue_wait_ms,
+                                )
+                            {
+                                cancelled.store(true, Ordering::Relaxed);
+                            }
+                            Ok(VisitorControl::Continue)
+                        },
+                    );
+                    match scan_result {
+                        Ok(outcome) => {
+                            if !send_with_wait(
+                                &sender,
+                                TableMessage::Outcome(outcome),
+                                &queue_wait_ms,
+                            ) {
+                                cancelled.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ =
+                                send_with_wait(&sender, TableMessage::Error(error), &queue_wait_ms);
+                            cancelled.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+                log::trace!("prefix key scan worker {} finished", worker_index);
+            });
+        }
+        drop(sender);
+
+        let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = worker_count;
+        for message in receiver {
+            outcome.cancel_checks = outcome.cancel_checks.saturating_add(1);
+            match message {
+                TableMessage::Key(key) => {
+                    check_scan_cancelled(options)?;
+                    outcome.record(0);
+                    if visitor(&key)? == VisitorControl::Stop {
+                        outcome.stopped = true;
+                        cancelled.store(true, Ordering::Relaxed);
+                        outcome.queue_wait_ms = outcome
+                            .queue_wait_ms
+                            .saturating_add(u128::from(queue_wait_ms.load(Ordering::Relaxed)));
+                        return Ok(outcome);
+                    }
+                    if should_emit_scan_progress(options, outcome.visited) {
+                        emit_scan_progress(options, outcome);
+                    }
+                }
+                TableMessage::Outcome(worker_outcome) => {
+                    merge_parallel_worker_metadata(&mut outcome, worker_outcome);
+                }
+                TableMessage::Error(error) => {
+                    cancelled.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
+        }
+        outcome.queue_wait_ms = outcome
+            .queue_wait_ms
+            .saturating_add(u128::from(queue_wait_ms.load(Ordering::Relaxed)));
         Ok(outcome)
     })
 }
@@ -1654,17 +2135,21 @@ where
         return Ok((ScanOutcome::empty(), Vec::new()));
     }
     let worker_count = threads.max(1).min(table_paths.len());
+    let queue_depth = parallel_queue_depth(options, worker_count, table_paths.len());
     let worker_paths = partition_paths_by_size(table_paths, worker_count);
 
     let hidden_keys = Arc::new(hidden_keys);
     let cancelled = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = mpsc::channel::<TableMessage<T>>();
-    thread::scope(|scope| {
+    let queue_wait_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (sender, receiver) = mpsc::sync_channel::<TableMessage<T>>(queue_depth);
+    let pool = scan_pool(worker_count)?;
+    pool.scope(|scope| {
         for paths in worker_paths {
             let sender = sender.clone();
             let hidden_keys = hidden_keys.clone();
             let cancelled = cancelled.clone();
-            scope.spawn(move || {
+            let queue_wait_ms = Arc::clone(&queue_wait_ms);
+            scope.spawn(move |_| {
                 let mut partition = init();
                 let mut outcome = ScanOutcome::empty();
                 for path in paths {
@@ -1687,19 +2172,26 @@ where
                             }
                         }
                         Err(error) => {
-                            let _ = sender.send(TableMessage::Error(error));
+                            let _ =
+                                send_with_wait(&sender, TableMessage::Error(error), &queue_wait_ms);
                             cancelled.store(true, Ordering::Relaxed);
                             return;
                         }
                     }
                 }
-                let _ = sender.send(TableMessage::Partition(partition, outcome));
+                let _ = send_with_wait(
+                    &sender,
+                    TableMessage::Partition(partition, outcome),
+                    &queue_wait_ms,
+                );
             });
         }
         drop(sender);
         let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = worker_count;
         let mut partitions = Vec::new();
         for message in receiver {
+            outcome.cancel_checks = outcome.cancel_checks.saturating_add(1);
             check_scan_cancelled(options)?;
             match message {
                 TableMessage::Partition(partition, partition_outcome) => {
@@ -1715,6 +2207,9 @@ where
                 }
             }
         }
+        outcome.queue_wait_ms = outcome
+            .queue_wait_ms
+            .saturating_add(u128::from(queue_wait_ms.load(Ordering::Relaxed)));
         Ok((outcome, partitions))
     })
 }
@@ -1744,17 +2239,21 @@ where
         return Ok((ScanOutcome::empty(), Vec::new()));
     }
     let worker_count = threads.max(1).min(table_paths.len());
+    let queue_depth = parallel_queue_depth(options, worker_count, table_paths.len());
     let worker_paths = partition_paths_by_size(table_paths, worker_count);
 
     let hidden_keys = Arc::new(hidden_keys);
     let cancelled = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = mpsc::channel::<TableMessage<T>>();
-    thread::scope(|scope| {
+    let queue_wait_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (sender, receiver) = mpsc::sync_channel::<TableMessage<T>>(queue_depth);
+    let pool = scan_pool(worker_count)?;
+    pool.scope(|scope| {
         for paths in worker_paths {
             let sender = sender.clone();
             let hidden_keys = hidden_keys.clone();
             let cancelled = cancelled.clone();
-            scope.spawn(move || {
+            let queue_wait_ms = Arc::clone(&queue_wait_ms);
+            scope.spawn(move |_| {
                 let mut partition = init();
                 let mut outcome = ScanOutcome::empty();
                 for path in paths {
@@ -1781,19 +2280,26 @@ where
                             }
                         }
                         Err(error) => {
-                            let _ = sender.send(TableMessage::Error(error));
+                            let _ =
+                                send_with_wait(&sender, TableMessage::Error(error), &queue_wait_ms);
                             cancelled.store(true, Ordering::Relaxed);
                             return;
                         }
                     }
                 }
-                let _ = sender.send(TableMessage::Partition(partition, outcome));
+                let _ = send_with_wait(
+                    &sender,
+                    TableMessage::Partition(partition, outcome),
+                    &queue_wait_ms,
+                );
             });
         }
         drop(sender);
         let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = worker_count;
         let mut partitions = Vec::new();
         for message in receiver {
+            outcome.cancel_checks = outcome.cancel_checks.saturating_add(1);
             check_scan_cancelled(options)?;
             match message {
                 TableMessage::Partition(partition, partition_outcome) => {
@@ -1809,6 +2315,9 @@ where
                 }
             }
         }
+        outcome.queue_wait_ms = outcome
+            .queue_wait_ms
+            .saturating_add(u128::from(queue_wait_ms.load(Ordering::Relaxed)));
         Ok((outcome, partitions))
     })
 }
@@ -1817,6 +2326,8 @@ where
 mod tests {
     use super::*;
     use crate::options::{CompressionPolicy, ScanCancelFlag};
+    #[cfg(feature = "async")]
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -1891,6 +2402,147 @@ mod tests {
         assert_eq!(values[1].1, Bytes::from_static(b"two"));
         let stats = db.stats().expect("stats");
         assert!(stats.approximate_bytes >= 18);
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[test]
+    fn db_scans_prefix_keys_without_values() {
+        let path = temp_dir("scan-prefix-keys");
+        let options = OpenOptions {
+            compression_policy: CompressionPolicy::None,
+            ..OpenOptions::default()
+        };
+        let db = Db::open(&path, options).expect("open");
+        db.put(
+            b"chunk_a".as_slice(),
+            b"one".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put a");
+        db.put(
+            b"chunk_b".as_slice(),
+            b"two".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put b");
+        db.put(
+            b"other".as_slice(),
+            b"three".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put other");
+        db.flush().expect("flush");
+
+        let mut keys = Vec::new();
+        let outcome = db
+            .for_each_prefix_key(b"chunk_", ReadOptions::default(), |key| {
+                keys.push(Bytes::copy_from_slice(key));
+                Ok(VisitorControl::Continue)
+            })
+            .expect("prefix key scan");
+
+        assert_eq!(
+            keys,
+            vec![
+                Bytes::from_static(b"chunk_a"),
+                Bytes::from_static(b"chunk_b")
+            ]
+        );
+        assert_eq!(outcome.visited, 2);
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[test]
+    fn owned_collectors_return_keys_and_values() {
+        let path = temp_dir("owned-collectors");
+        let db = Db::open(&path, OpenOptions::default()).expect("open");
+        db.put(
+            b"chunk_a".as_slice(),
+            b"one".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put a");
+        db.put(
+            b"chunk_b".as_slice(),
+            b"two".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put b");
+        db.put(
+            b"other".as_slice(),
+            b"three".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put other");
+
+        let keys = db
+            .collect_prefix_keys_owned(b"chunk_", ReadOptions::default())
+            .expect("collect keys");
+        let entries = db
+            .collect_prefix_owned(b"chunk_", ReadOptions::default())
+            .expect("collect entries");
+
+        assert_eq!(
+            keys,
+            vec![
+                Bytes::from_static(b"chunk_a"),
+                Bytes::from_static(b"chunk_b")
+            ]
+        );
+        assert_eq!(
+            entries,
+            vec![
+                (Bytes::from_static(b"chunk_a"), Bytes::from_static(b"one")),
+                (Bytes::from_static(b"chunk_b"), Bytes::from_static(b"two")),
+            ]
+        );
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn async_owned_reads_collect_prefix_keys() {
+        let path = temp_dir("async-prefix-keys");
+        let options = OpenOptions {
+            compression_policy: CompressionPolicy::None,
+            ..OpenOptions::default()
+        };
+        let db = Arc::new(Db::open(&path, options).expect("open"));
+        db.put(
+            b"chunk_a".as_slice(),
+            b"one".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put a");
+        db.put(
+            b"chunk_b".as_slice(),
+            b"two".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put b");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let keys = runtime
+            .block_on(db.clone().collect_prefix_keys_owned_async(
+                Bytes::from_static(b"chunk_"),
+                ReadOptions::default(),
+            ))
+            .expect("async prefix keys");
+        let value = runtime
+            .block_on(db.get_async(Bytes::from_static(b"chunk_a")))
+            .expect("async get")
+            .expect("value");
+
+        assert_eq!(
+            keys,
+            vec![
+                Bytes::from_static(b"chunk_a"),
+                Bytes::from_static(b"chunk_b")
+            ]
+        );
+        assert_eq!(value, Bytes::from_static(b"one"));
         std::fs::remove_dir_all(path).expect("cleanup");
     }
 
