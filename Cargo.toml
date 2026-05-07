@@ -28,6 +28,9 @@ include = [
 name = "bedrock_leveldb"
 path = "src/bedrock_leveldb.rs"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = ["zlib", "snappy", "async"]
 async = ["dep:tokio"]

@@ -4,6 +4,13 @@ All notable changes to `bedrock-leveldb` are tracked here.
 
 ## 0.2.1 - 2026-05-07
 
+### Documentation
+
+- Added docs.rs all-features metadata and expanded the crate-level feature
+  overview for the hosted API reference.
+- Clarified crates.io package contents and feature behavior in the English and
+  Simplified Chinese READMEs.
+
 ### Fixed
 
 - Replaced an unstable `if` let-chain in native table multi-get code with

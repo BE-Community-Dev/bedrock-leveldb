@@ -47,7 +47,9 @@ jobs:
         run: cargo rustdoc --all-features -- -D missing_docs
       - name: Dry run
         run: cargo publish --dry-run
-      - name: Publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --no-verify
+      # Publishing is intentionally disabled until the release owner configures
+      # crates.io publishing outside this repository.
+      # - name: Publish
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      #   run: cargo publish --no-verify

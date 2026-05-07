@@ -27,6 +27,13 @@
 //! as `LegacyTerrain` and pre-paletted `SubChunkPrefix` values, but they do not
 //! interpret NBT, actors, players, or gameplay semantics.
 //!
+//! # Features
+//!
+//! docs.rs builds this crate with all features enabled. Default builds enable
+//! `zlib`, `snappy`, and `async`. Optional `mmap` exposes read-only mapped
+//! table scans, while `repair-tools` and `bench` are reserved for tooling and
+//! benchmark-only paths.
+//!
 //! # Example
 //!
 //! ```

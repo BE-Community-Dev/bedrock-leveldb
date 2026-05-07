@@ -242,6 +242,10 @@ assert!(error.path().is_some());
 | `repair-tools` | 否 | 为更完整 repair 工具预留 |
 | `bench` | 否 | 为 benchmark-only 代码路径预留 |
 
+docs.rs 会启用全部 features 构建，因此托管 API 文档会包含 async helper、
+压缩后端、mapped scan 类型和 repair-tool 入口。crates.io 包包含英文/中文
+README、`docs/` 下的指南、changelog、许可证、源码、测试和 benchmark。
+
 最低 Rust 版本为 1.87。
 
 ## 测试和 Benchmark

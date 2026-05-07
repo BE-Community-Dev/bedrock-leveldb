@@ -267,6 +267,12 @@ return `ErrorKind::ReadOnly` for writes, flushes, repair, and compaction.
 | `repair-tools` | no | Reserved for expanded repair tooling |
 | `bench` | no | Reserved for benchmark-only code paths |
 
+docs.rs builds with all features enabled, so the hosted API reference includes
+async helpers, compression backends, mapped scan types, and repair-tool entry
+points. The crates.io package includes the English and Chinese READMEs, the
+guide documents under `docs/`, the changelog, licenses, source, tests, and
+benchmarks.
+
 MSRV is Rust 1.87.
 
 ## Testing And Benchmarks
