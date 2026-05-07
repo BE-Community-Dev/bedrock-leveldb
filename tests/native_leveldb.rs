@@ -1,4 +1,11 @@
-use bedrock_leveldb::{Db, OpenOptions, ReadOptions, VisitorControl};
+#[cfg(feature = "zlib")]
+use bedrock_leveldb::{
+    ChunkCoordinates, ChunkKey, ChunkRecordTag, Dimension, LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN,
+    LEGACY_TERRAIN_VALUE_LEN, SubChunkIndex,
+};
+use bedrock_leveldb::{
+    Db, OpenOptions, ReadOptions, ReadStrategy, ScanMode, ValueRef, VisitorControl,
+};
 use bytes::Bytes;
 use std::cmp::Ordering;
 use std::io::Write;
@@ -8,6 +15,10 @@ const VALUE_TYPE_DELETION: u8 = 0;
 const VALUE_TYPE_VALUE: u8 = 1;
 const LEVELDB_TABLE_MAGIC: u64 = 0xdb47_7524_8b80_fb57;
 const FULL_RECORD: u8 = 1;
+#[cfg(feature = "zlib")]
+const COMPRESSION_ZLIB: u8 = 2;
+#[cfg(feature = "zlib")]
+const COMPRESSION_DEFLATE: u8 = 4;
 
 #[derive(Clone)]
 struct NativeEntry {
@@ -72,6 +83,44 @@ fn native_table_point_prefix_and_deletion_records_are_read() {
 }
 
 #[test]
+fn native_uncompressed_prefix_ref_returns_borrowed_values() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let entries = vec![
+        NativeEntry::value(b"player_1", 3, b"steve"),
+        NativeEntry::value(b"player_2", 3, b"alex"),
+    ];
+    let meta = write_native_table(temp.path(), 3, &entries).expect("write table");
+    write_native_manifest(temp.path(), &[meta], 2).expect("write manifest");
+
+    let db = open_native_read_only(temp.path());
+    let mut borrowed = 0usize;
+    let mut values = Vec::new();
+    db.for_each_prefix_ref(
+        b"player_",
+        ReadOptions {
+            read_strategy: ReadStrategy::Borrowed,
+            scan_mode: ScanMode::Sequential,
+            ..ReadOptions::default()
+        },
+        |entry| {
+            if matches!(entry.value, ValueRef::Borrowed(_)) {
+                borrowed = borrowed.saturating_add(1);
+            }
+            values.push(Bytes::copy_from_slice(entry.value.as_bytes()));
+            Ok(VisitorControl::Continue)
+        },
+    )
+    .expect("prefix ref");
+
+    values.sort();
+    assert_eq!(
+        values,
+        vec![Bytes::from_static(b"alex"), Bytes::from_static(b"steve")]
+    );
+    assert_eq!(borrowed, 2);
+}
+
+#[test]
 fn native_manifest_ranges_skip_unrelated_newer_corrupt_tables() {
     let temp = tempfile::tempdir().expect("tempdir");
     let good_entries = vec![NativeEntry::value(b"target", 7, b"value")];
@@ -91,6 +140,80 @@ fn native_manifest_ranges_skip_unrelated_newer_corrupt_tables() {
         db.get(b"target").expect("get"),
         Some(Bytes::from_static(b"value"))
     );
+}
+
+#[cfg(feature = "zlib")]
+#[test]
+fn native_compressed_tables_get_many_reads_legacy_records_in_order() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let legacy_terrain_key = Bytes::from(
+        ChunkKey::new(
+            ChunkCoordinates::new(0, 0),
+            Dimension::Overworld,
+            ChunkRecordTag::LegacyTerrain,
+        )
+        .encode(),
+    );
+    let legacy_subchunk_key = Bytes::from(
+        ChunkKey::new_subchunk(
+            ChunkCoordinates::new(0, 0),
+            Dimension::Overworld,
+            SubChunkIndex::from_raw(0),
+        )
+        .encode(),
+    );
+    let modern_subchunk_key = Bytes::from(
+        ChunkKey::new_subchunk(
+            ChunkCoordinates::new(1, 0),
+            Dimension::Overworld,
+            SubChunkIndex::from_raw(0),
+        )
+        .encode(),
+    );
+    let terrain = vec![7_u8; LEGACY_TERRAIN_VALUE_LEN];
+    let mut legacy_subchunk = vec![0_u8; LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN];
+    legacy_subchunk[0] = 2;
+    legacy_subchunk[1 + 1_125] = 99;
+    let modern_subchunk = b"\x08\x00modern-paletted-native".to_vec();
+
+    let zlib_meta = write_native_table_compressed_data(
+        temp.path(),
+        3,
+        &[NativeEntry::value(&legacy_terrain_key, 7, &terrain)],
+        COMPRESSION_ZLIB,
+    )
+    .expect("write zlib table");
+    let deflate_meta = write_native_table_compressed_data(
+        temp.path(),
+        4,
+        &[
+            NativeEntry::value(&legacy_subchunk_key, 7, &legacy_subchunk),
+            NativeEntry::value(&modern_subchunk_key, 7, &modern_subchunk),
+        ],
+        COMPRESSION_DEFLATE,
+    )
+    .expect("write deflate table");
+    write_native_manifest(temp.path(), &[zlib_meta, deflate_meta], 2).expect("write manifest");
+
+    let db = open_native_read_only(temp.path());
+    let values = db
+        .get_many_owned(
+            vec![
+                Bytes::from_static(b"missing"),
+                legacy_terrain_key.clone(),
+                legacy_subchunk_key,
+                modern_subchunk_key,
+                legacy_terrain_key,
+            ],
+            ReadOptions::default(),
+        )
+        .expect("get many");
+
+    assert!(values[0].is_none());
+    assert_eq!(values[1], Some(Bytes::from(terrain.clone())));
+    assert_eq!(values[2], Some(Bytes::from(legacy_subchunk)));
+    assert_eq!(values[3], Some(Bytes::from(modern_subchunk)));
+    assert_eq!(values[4], Some(Bytes::from(terrain)));
 }
 
 impl NativeEntry {
@@ -194,6 +317,68 @@ fn write_native_table(
     })
 }
 
+#[cfg(feature = "zlib")]
+fn write_native_table_compressed_data(
+    root: &Path,
+    number: u64,
+    entries: &[NativeEntry],
+    data_compression: u8,
+) -> std::io::Result<TableMeta> {
+    let mut internal_entries = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.internal_key(),
+                entry.value.clone().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    internal_entries.sort_by(|left, right| compare_internal_keys(&left.0, &right.0));
+
+    let smallest = internal_entries
+        .first()
+        .expect("native table needs entries")
+        .0
+        .clone();
+    let largest = internal_entries
+        .last()
+        .expect("native table needs entries")
+        .0
+        .clone();
+
+    let data_block = block(&internal_entries);
+    let encoded_data_block = compress_native_block(&data_block, data_compression)?;
+    let index_offset = u64::try_from(encoded_data_block.len() + 5).expect("small fixture");
+    let mut index_value = Vec::new();
+    put_varint64(0, &mut index_value);
+    put_varint64(
+        u64::try_from(encoded_data_block.len()).expect("small fixture"),
+        &mut index_value,
+    );
+    let index_block = block(&[(largest.clone(), index_value)]);
+
+    let mut table = Vec::new();
+    table.extend_from_slice(&encoded_data_block);
+    push_block_trailer_with_compression(&mut table, &encoded_data_block, data_compression);
+    table.extend_from_slice(&index_block);
+    push_block_trailer(&mut table, &index_block);
+    push_footer(
+        &mut table,
+        index_offset,
+        u64::try_from(index_block.len()).expect("small fixture"),
+    );
+
+    let path = root.join(format!("{number:06}.ldb"));
+    std::fs::write(path, &table)?;
+
+    Ok(TableMeta {
+        number,
+        file_size: u64::try_from(table.len()).expect("small fixture"),
+        smallest,
+        largest,
+    })
+}
+
 fn write_native_manifest(
     root: &Path,
     tables: &[TableMeta],
@@ -247,9 +432,32 @@ fn block(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn push_block_trailer(out: &mut Vec<u8>, payload: &[u8]) {
-    out.push(0);
-    let checksum = masked_crc32c(&[payload, &[0]]);
+    push_block_trailer_with_compression(out, payload, 0);
+}
+
+fn push_block_trailer_with_compression(out: &mut Vec<u8>, payload: &[u8], compression: u8) {
+    out.push(compression);
+    let checksum = masked_crc32c(&[payload, &[compression]]);
     out.extend_from_slice(&checksum.to_le_bytes());
+}
+
+#[cfg(feature = "zlib")]
+fn compress_native_block(payload: &[u8], compression: u8) -> std::io::Result<Vec<u8>> {
+    match compression {
+        COMPRESSION_ZLIB => {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(payload)?;
+            encoder.finish()
+        }
+        COMPRESSION_DEFLATE => {
+            let mut encoder =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(payload)?;
+            encoder.finish()
+        }
+        other => panic!("unsupported compressed test tag {other}"),
+    }
 }
 
 fn push_footer(out: &mut Vec<u8>, index_offset: u64, index_size: u64) {

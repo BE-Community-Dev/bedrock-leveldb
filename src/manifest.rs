@@ -1,8 +1,13 @@
-use crate::coding::{get_length_prefixed_slice, get_varint32, get_varint64};
+use crate::coding::{
+    get_length_prefixed_slice, get_varint32, get_varint64, put_length_prefixed_slice, put_varint32,
+    put_varint64,
+};
 use crate::error::{LevelDbError, Result};
 use crate::wal;
+use std::collections::BTreeSet;
 use std::fs;
 use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const MANIFEST_MAGIC: &[u8; 9] = b"BWLDBMAN1";
@@ -10,8 +15,11 @@ const MANIFEST_MAGIC: &[u8; 9] = b"BWLDBMAN1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableFileMeta {
     pub(crate) number: u64,
+    pub(crate) file_size: u64,
     pub(crate) smallest_key: Option<Vec<u8>>,
     pub(crate) largest_key: Option<Vec<u8>>,
+    pub(crate) smallest_internal_key: Option<Vec<u8>>,
+    pub(crate) largest_internal_key: Option<Vec<u8>>,
 }
 
 impl TableFileMeta {
@@ -19,8 +27,28 @@ impl TableFileMeta {
     pub(crate) const fn without_range(number: u64) -> Self {
         Self {
             number,
+            file_size: 0,
             smallest_key: None,
             largest_key: None,
+            smallest_internal_key: None,
+            largest_internal_key: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn native(
+        number: u64,
+        file_size: u64,
+        smallest_internal_key: Vec<u8>,
+        largest_internal_key: Vec<u8>,
+    ) -> Self {
+        Self {
+            number,
+            file_size,
+            smallest_key: internal_user_key(&smallest_internal_key).map(<[u8]>::to_vec),
+            largest_key: internal_user_key(&largest_internal_key).map(<[u8]>::to_vec),
+            smallest_internal_key: Some(smallest_internal_key),
+            largest_internal_key: Some(largest_internal_key),
         }
     }
 
@@ -170,26 +198,63 @@ impl Manifest {
 
     fn write_file(&self, path: &Path) -> Result<()> {
         let tmp_path = tmp_path(path);
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(MANIFEST_MAGIC);
-        bytes.extend_from_slice(&self.next_file_number.to_le_bytes());
-        bytes.extend_from_slice(&self.log_number.to_le_bytes());
-        bytes.extend_from_slice(
-            &u64::try_from(self.table_numbers.len())
-                .map_err(|_| LevelDbError::invalid_argument("too many tables".to_string()))?
-                .to_le_bytes(),
-        );
-        for table in &self.table_numbers {
-            bytes.extend_from_slice(&table.to_le_bytes());
-        }
-        fs::write(&tmp_path, bytes)
-            .map_err(|error| LevelDbError::io_at("write manifest temp file", &tmp_path, error))?;
+        self.write_native_file(&tmp_path)?;
         if path.exists() {
             fs::remove_file(path)
                 .map_err(|error| LevelDbError::io_at("replace manifest", path, error))?;
         }
         fs::rename(&tmp_path, path)
             .map_err(|error| LevelDbError::io_at("rename manifest temp file", path, error))?;
+        Ok(())
+    }
+
+    fn write_native_file(&self, path: &Path) -> Result<()> {
+        let mut edit = Vec::new();
+        put_varint32(1, &mut edit);
+        put_length_prefixed_slice(b"leveldb.BytewiseComparator", &mut edit)?;
+        put_varint32(2, &mut edit);
+        put_varint64(self.log_number, &mut edit);
+        put_varint32(3, &mut edit);
+        put_varint64(self.next_file_number, &mut edit);
+        put_varint32(4, &mut edit);
+        put_varint64(self.next_file_number.saturating_add(1024), &mut edit);
+        let table_numbers = self
+            .table_files
+            .iter()
+            .map(|table| table.number)
+            .collect::<BTreeSet<_>>();
+        for table_number in self
+            .table_numbers
+            .iter()
+            .filter(|table_number| !table_numbers.contains(table_number))
+        {
+            put_varint32(7, &mut edit);
+            put_varint32(0, &mut edit);
+            put_varint64(*table_number, &mut edit);
+            put_varint64(0, &mut edit);
+            put_length_prefixed_slice(&[], &mut edit)?;
+            put_length_prefixed_slice(&[], &mut edit)?;
+        }
+        for table in &self.table_files {
+            put_varint32(7, &mut edit);
+            put_varint32(0, &mut edit);
+            put_varint64(table.number, &mut edit);
+            put_varint64(table.file_size, &mut edit);
+            put_length_prefixed_slice(
+                table.smallest_internal_key.as_deref().unwrap_or(&[]),
+                &mut edit,
+            )?;
+            put_length_prefixed_slice(
+                table.largest_internal_key.as_deref().unwrap_or(&[]),
+                &mut edit,
+            )?;
+        }
+
+        let mut file = File::create(path)
+            .map_err(|error| LevelDbError::io_at("create native manifest", path, error))?;
+        wal::append_record(&mut file, &edit)?;
+        file.flush()
+            .map_err(|error| LevelDbError::io_at("flush native manifest", path, error))?;
         Ok(())
     }
 }
@@ -227,14 +292,17 @@ fn parse_native_version_edit(mut input: &[u8], manifest: &mut Manifest) -> Resul
             7 => {
                 let _level = get_varint32(&mut input)?;
                 let file_number = get_varint64(&mut input)?;
-                let _file_size = get_varint64(&mut input)?;
+                let file_size = get_varint64(&mut input)?;
                 let smallest = get_length_prefixed_slice(&mut input)?;
                 let largest = get_length_prefixed_slice(&mut input)?;
                 manifest.table_numbers.push(file_number);
                 manifest.table_files.push(TableFileMeta {
                     number: file_number,
+                    file_size,
                     smallest_key: internal_user_key(smallest).map(<[u8]>::to_vec),
                     largest_key: internal_user_key(largest).map(<[u8]>::to_vec),
+                    smallest_internal_key: Some(smallest.to_vec()),
+                    largest_internal_key: Some(largest.to_vec()),
                 });
             }
             other => {

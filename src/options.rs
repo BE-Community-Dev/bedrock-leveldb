@@ -1,11 +1,11 @@
-/// Compression used when this crate writes its own custom `BWLDB...` tables.
+/// Compression used when this crate writes native `LevelDB` table blocks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CompressionPolicy {
-    /// Store custom table payloads uncompressed.
+    /// Store native table blocks uncompressed.
     None,
-    /// Compress custom table payloads with Snappy.
+    /// Compress native table blocks with Snappy.
     Snappy,
-    /// Compress custom table payloads with zlib.
+    /// Compress native table blocks with zlib.
     #[default]
     Zlib,
 }
@@ -16,17 +16,17 @@ pub enum CompressionPolicy {
 pub struct OpenOptions {
     /// Open without performing writes, initialization, repair, or flushes.
     pub read_only: bool,
-    /// Create the database directory and initial custom manifest when missing.
+    /// Create the database directory and initial native manifest when missing.
     pub create_if_missing: bool,
     /// Fail if the target directory already contains files.
     pub error_if_exists: bool,
     /// Verify checksums while replaying logs and reading table blocks by default.
     pub paranoid_checks: bool,
-    /// Compression used for tables written by this crate.
+    /// Compression used for native tables written by this crate.
     pub compression_policy: CompressionPolicy,
     /// Maximum decoded native table block cache size, in bytes.
     pub cache_size: usize,
-    /// Approximate overlay size that triggers a flush to a custom table.
+    /// Approximate overlay size that triggers a flush to a native table.
     pub write_buffer_size: usize,
 }
 
@@ -57,6 +57,8 @@ pub struct ReadOptions {
     pub checksum: ChecksumMode,
     /// Whether the native decoded block cache may be used.
     pub cache_policy: CachePolicy,
+    /// Preferred ownership model for values returned by read APIs.
+    pub read_strategy: ReadStrategy,
     /// Worker selection for parallel table scans.
     pub threading: ThreadingOptions,
     /// Sequential or table-parallel scan execution.
@@ -73,7 +75,8 @@ impl Default for ReadOptions {
     fn default() -> Self {
         Self {
             checksum: ChecksumMode::Inherit,
-            cache_policy: CachePolicy::Use,
+            cache_policy: CachePolicy::Bypass,
+            read_strategy: ReadStrategy::Shared,
             threading: ThreadingOptions::Auto,
             scan_mode: ScanMode::Sequential,
             pipeline: ScanPipelineOptions::default(),
@@ -146,10 +149,25 @@ pub enum ChecksumMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CachePolicy {
     /// Use the database's native block cache.
-    #[default]
     Use,
     /// Bypass the native block cache for this read.
+    #[default]
     Bypass,
+}
+
+/// Value ownership strategy for point reads and visitor callbacks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReadStrategy {
+    /// Prefer borrowed views when the backend can tie the value lifetime to an
+    /// in-memory table/block buffer.
+    Borrowed,
+    /// Prefer shared reference-counted buffers. This is the default because it
+    /// works uniformly for compressed blocks and overlay values.
+    #[default]
+    Shared,
+    /// Force APIs that support borrowed/shared values to materialize owned
+    /// buffers before returning them.
+    Owned,
 }
 
 /// Visitor result used by scan callbacks.
@@ -178,6 +196,18 @@ pub struct ScanOutcome {
     pub queue_wait_ms: u128,
     /// Number of cooperative cancellation checks performed by the scan.
     pub cancel_checks: usize,
+    /// Number of exact point lookups performed by batch read APIs.
+    pub exact_gets: usize,
+    /// Number of exact point lookup batches performed.
+    pub exact_get_batches: usize,
+    /// Number of table-index cache hits during exact point lookups.
+    pub table_index_hits: usize,
+    /// Number of table-index cache misses during exact point lookups.
+    pub table_index_misses: usize,
+    /// Number of data-block cache hits during exact point lookups.
+    pub data_block_hits: usize,
+    /// Number of data-block cache misses during exact point lookups.
+    pub data_block_misses: usize,
 }
 
 impl ScanOutcome {
@@ -192,6 +222,12 @@ impl ScanOutcome {
             worker_threads: 0,
             queue_wait_ms: 0,
             cancel_checks: 0,
+            exact_gets: 0,
+            exact_get_batches: 0,
+            table_index_hits: 0,
+            table_index_misses: 0,
+            data_block_hits: 0,
+            data_block_misses: 0,
         }
     }
 
@@ -210,6 +246,18 @@ impl ScanOutcome {
         self.worker_threads = self.worker_threads.max(other.worker_threads);
         self.queue_wait_ms = self.queue_wait_ms.saturating_add(other.queue_wait_ms);
         self.cancel_checks = self.cancel_checks.saturating_add(other.cancel_checks);
+        self.exact_gets = self.exact_gets.saturating_add(other.exact_gets);
+        self.exact_get_batches = self
+            .exact_get_batches
+            .saturating_add(other.exact_get_batches);
+        self.table_index_hits = self.table_index_hits.saturating_add(other.table_index_hits);
+        self.table_index_misses = self
+            .table_index_misses
+            .saturating_add(other.table_index_misses);
+        self.data_block_hits = self.data_block_hits.saturating_add(other.data_block_hits);
+        self.data_block_misses = self
+            .data_block_misses
+            .saturating_add(other.data_block_misses);
     }
 }
 
@@ -398,5 +446,12 @@ mod tests {
         assert_eq!(explicit.resolve_queue_depth(4, 128), 7);
         assert_eq!(explicit.resolve_table_batch_size(4, 128), 3);
         assert_eq!(explicit.resolve_progress_interval(), 11);
+    }
+
+    #[test]
+    fn default_reads_bypass_shared_cache_and_use_shared_values() {
+        let options = ReadOptions::default();
+        assert_eq!(options.cache_policy, CachePolicy::Bypass);
+        assert_eq!(options.read_strategy, ReadStrategy::Shared);
     }
 }

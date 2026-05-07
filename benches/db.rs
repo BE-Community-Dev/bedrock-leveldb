@@ -1,8 +1,8 @@
 #![allow(clippy::too_many_lines)]
 
 use bedrock_leveldb::{
-    CompressionPolicy, Db, OpenOptions, ReadOptions, ScanMode, VisitorControl, WriteBatch,
-    WriteOptions,
+    CompressionPolicy, Db, OpenOptions, ReadOptions, ReadStrategy, ScanMode, VisitorControl,
+    WriteBatch, WriteOptions,
 };
 use bytes::Bytes;
 use criterion::{
@@ -105,6 +105,21 @@ fn bench_point_get(c: &mut Criterion) {
             });
         });
     }
+    group.bench_function("native_table_ref_shared", |b| {
+        b.iter(|| {
+            black_box(
+                native_db
+                    .get_with_ref(
+                        black_box(b"chunk:002048"),
+                        ReadOptions {
+                            read_strategy: ReadStrategy::Shared,
+                            ..ReadOptions::default()
+                        },
+                    )
+                    .expect("get ref"),
+            );
+        });
+    });
     drop(native_dir);
     group.finish();
 }
@@ -161,6 +176,38 @@ fn bench_scans(c: &mut Criterion) {
             },
         );
     }
+    group.bench_function("native_prefix_ref_shared", |b| {
+        b.iter(|| {
+            let mut bytes = 0usize;
+            native_db
+                .for_each_prefix_ref(b"chunk:00", ReadOptions::default(), |entry| {
+                    bytes = bytes.saturating_add(entry.value.len());
+                    Ok(VisitorControl::Continue)
+                })
+                .expect("scan prefix refs");
+            black_box(bytes);
+        });
+    });
+    group.bench_function("native_prefix_ref_borrowed_mmap", |b| {
+        b.iter(|| {
+            let mut bytes = 0usize;
+            native_db
+                .for_each_prefix_ref(
+                    b"chunk:00",
+                    ReadOptions {
+                        read_strategy: ReadStrategy::Borrowed,
+                        scan_mode: ScanMode::Sequential,
+                        ..ReadOptions::default()
+                    },
+                    |entry| {
+                        bytes = bytes.saturating_add(entry.value.len());
+                        Ok(VisitorControl::Continue)
+                    },
+                )
+                .expect("scan borrowed prefix refs");
+            black_box(bytes);
+        });
+    });
     group.finish();
 }
 

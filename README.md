@@ -2,15 +2,17 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-`bedrock-leveldb` is a read-first, pure Rust raw key/value library for
-Minecraft Bedrock world databases. It focuses on the storage layer only:
+`bedrock-leveldb` is a pure Rust raw key/value storage library for
+Minecraft Bedrock world databases. The performance target is benchmark-backed
+zero-copy where possible, lock-free read hot paths after a short state snapshot,
+and explicit owned allocation when callers request it. It focuses on the storage layer only:
 chunk, actor, player, and NBT semantics are intentionally out of scope and
 belong in application code or domain-specific layers.
 
 The crate can read native Bedrock/LevelDB manifests, WAL records, and table
-files. Its write APIs are intentionally limited for local tooling: data written
-or flushed by this crate uses the crate's own `BWLDB...` table and manifest
-format, not native LevelDB output for interchange with other engines.
+files. v0.2 writes standard LevelDB WAL batches, flushes native `.ldb` tables,
+and persists manifest version edits. Older `BWLDB...` files remain readable for
+migration/backward compatibility only.
 
 Maintainers and contributors should also read the
 [development guide](docs/DEVELOPMENT.md).
@@ -71,20 +73,36 @@ repair, flush, or write to the database directory.
 | Visitor scans | Key, entry, prefix, sequential, and table-parallel modes |
 | Native block cache | Bounded decoded block cache |
 | Bedrock chunk key helpers | Parse and encode documented LevelDB chunk keys |
-| Legacy `LegacyTerrain` values | Validate and expose the 83,200-byte early LevelDB terrain layout |
+| Legacy `LegacyTerrain` values | Validate and expose the 83,200-byte early LevelDB terrain layout, including `[biome_id, red, green, blue]` biome samples |
 | Legacy subchunk values | Classify paletted subchunks and expose pre-paletted block ID/metadata arrays |
-| Writes by this crate | Custom `BWLDB...` format only |
-| Production LevelDB compaction | Not implemented |
-| Arbitrary corrupt database repair | Partial, writes custom repaired output |
+| Batch exact reads | `Db::get_many_owned` preserves input order for legacy and modern render keys |
+| Native writes by this crate | WAL batch append, native `.ldb` flush, manifest edit persistence |
+| Production LevelDB compaction | Correctness-first native range compaction |
+| Arbitrary corrupt database repair | Partial, writes native recovered output from readable data |
 | Pre-LevelDB worlds | Not supported; `chunks.dat` and `entities.dat` are outside this crate |
-| `mmap` read path | Feature reserved; default path uses seeked file I/O |
+| `mmap` read path | Feature-gated callback scans can borrow uncompressed custom/native table values |
 
 ## API Notes
 
 - `Db::open(path, OpenOptions)` loads `CURRENT`, manifest metadata, and the WAL
   overlay. It does not eagerly materialize every native table value.
-- `Db::get(key)` reads with default options. `Db::get_with(key, ReadOptions)`
-  allows per-call checksum and cache policy.
+- `Db::get(key)` is the compatibility owned/shared read path. `Db::get_ref`
+  and `Db::get_with_ref` return `ValueRef`, which can represent borrowed,
+  shared, or explicitly owned values. Cross-function point lookups stay shared
+  or owned so they cannot return dangling table slices.
+- `Db::for_each_entry_ref` and `Db::for_each_prefix_ref` are the true
+  borrowed-first APIs. With `ReadStrategy::Borrowed` and sequential scan mode,
+  uncompressed native LevelDB blocks return `ValueRef::Borrowed` inside the
+  visitor callback. Compressed blocks, WAL/overlay values, and non-callback
+  point reads return `Shared`/`Owned`.
+  Enabling the `mmap` feature maps table files read-only so those borrowed
+  slices are backed by the mapping for the duration of the callback.
+- `Db::get_many_owned(keys, ReadOptions)` is the preferred renderer path for
+  exact chunk records such as `LegacyTerrain` (`0x30`), `Data2D`, subchunks, and
+  block entities. It preserves input order and avoids prefix scans during tile
+  rendering. It returns raw values byte-for-byte; X/Y/Z coordinate interpretation
+  and legacy biome priority are intentionally tested and implemented in
+  `bedrock-world`/`bedrock-render`.
 - With the default `async` feature, `Arc<Db>` now provides owned async read
   helpers: `get_async`, `get_with_async`, `collect_keys_owned_async`,
   `collect_prefix_keys_owned_async`, and `collect_prefix_owned_async`. They use
@@ -93,11 +111,22 @@ repair, flush, or write to the database directory.
 - `Db::collect_keys_owned`, `Db::collect_prefix_keys_owned`, and
   `Db::collect_prefix_owned` return owned data without forcing callers to write
   visitor glue for common indexing paths.
+- `Db::write_batch_native`, `Db::flush_memtable`,
+  `Db::compact_range_native`, and `Db::recover_native` are the explicit v0.2
+  native write/recovery entry points. `Db::write`, `Db::flush`,
+  `Db::compact_range`, and `Db::repair` delegate to the same native paths.
+- `ReadOptions::cache_policy` defaults to `Bypass`, so normal reads do not
+  contend on the shared block cache. Set it to `Use` only when cross-request
+  block reuse is worth the lock cost.
 - `ReadOptions::pipeline` configures local Rayon scan scheduling. `queue_depth`,
   `table_batch_size`, and `progress_interval` use automatic defaults when set to
   zero. `ScanOutcome` reports `tables_scanned`, `worker_threads`,
   `queue_wait_ms`, and `cancel_checks` so renderers can tune without fixed
   machine-specific timing thresholds.
+- Old LevelDB worlds are still LevelDB databases. This crate reads native zlib
+  compression tag `2`, Bedrock raw deflate tag `4`, WAL + `.ldb` overlays, and
+  exact `LegacyTerrain` keys; pre-LevelDB `chunks.dat` parsing intentionally
+  lives in `bedrock-world`.
 - `Db::for_each_key`, `Db::for_each_entry`, and `Db::for_each_prefix` stream
   borrowed keys and `Bytes` values to visitors.
 - `Db::for_each_prefix_key` is the preferred render-index path when callers only
@@ -106,8 +135,7 @@ repair, flush, or write to the database directory.
 - Visitors return `VisitorControl::Continue` or `VisitorControl::Stop`; normal
   early termination is reported in `ScanOutcome`, not as an error.
 - `stats_fast()` is metadata/overlay-only. `stats_full()`, snapshots,
-  materialized iterators, repair, and custom compaction are explicit expensive
-  paths.
+  materialized iterators, repair, and compaction are explicit expensive paths.
 
 ### Migration: full prefix values to key-only scans
 
@@ -226,14 +254,14 @@ assert!(err.path().is_some());
 ```
 
 Cooperative scan cancellation returns `ErrorKind::Cancelled`. Read-only handles
-return `ErrorKind::ReadOnly` for writes, flushes, repair, and custom compaction.
+return `ErrorKind::ReadOnly` for writes, flushes, repair, and compaction.
 
 ## Features
 
 | Feature | Default | Meaning |
 | --- | --- | --- |
-| `zlib` | yes | Enables zlib and Bedrock raw-deflate decompression plus zlib custom writes |
-| `snappy` | yes | Enables Snappy table decompression plus Snappy custom writes |
+| `zlib` | yes | Enables zlib and Bedrock raw-deflate decompression/compression |
+| `snappy` | yes | Enables Snappy table decompression/compression |
 | `async` | yes | Adds `Db::open_async` through Tokio `spawn_blocking` |
 | `mmap` | no | Reserved for a future mapped read path |
 | `repair-tools` | no | Reserved for expanded repair tooling |
@@ -261,28 +289,11 @@ cargo bench --all-features
 ```
 
 The Criterion suite is synthetic. It separates overlay hot reads, flushed
-custom table reads, native table point/prefix reads, WAL recovery, and
+native table reads, native table point/prefix reads, WAL recovery, and
 sequential versus table-parallel scans. Large-world behavior should still be
 validated with real Bedrock fixtures in higher-level crates because this crate
-does not interpret world keys or NBT payloads.
-
-Latest local benchmark run: Windows, May 1 2026, rustc 1.93.1,
-Criterion sample size 10, 2 second measurement time. `gnuplot` was not
-installed, so Criterion used the Plotters backend. The native table benchmark
-uses synthetic native fixtures with the decoded block cache disabled. No logger
-backend was installed for this run, which is the default library usage.
-
-```text
-bedrock_leveldb/write/batch_1000_overlay        [2.4738 ms 2.5905 ms 2.6781 ms]
-bedrock_leveldb/get_point/overlay_hot           [85.575 ns 86.229 ns 87.213 ns]
-bedrock_leveldb/get_point/custom_table          [4.5060 ms 4.6603 ms 4.9609 ms]
-bedrock_leveldb/get_point/native_table          [4.8687 ms 5.0016 ms 5.3457 ms]
-bedrock_leveldb/scan/custom_for_each_key        [4.3913 ms 4.4688 ms 4.6315 ms]
-bedrock_leveldb/scan/custom_for_each_entry      [4.5432 ms 4.6145 ms 4.7531 ms]
-bedrock_leveldb/scan/native_for_each_prefix     [6.2553 ms 6.4846 ms 6.6705 ms]
-bedrock_leveldb/scan/native_parallel_tables     [3.2028 ms 3.2548 ms 3.3292 ms]
-bedrock_leveldb/recover/wal_1000_overlay        [1.8688 ms 1.9349 ms 2.0575 ms]
-```
+does not interpret world keys or NBT payloads. Latest local numbers are tracked
+in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## License
 

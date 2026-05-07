@@ -2,9 +2,9 @@
 //!
 //! `bedrock-leveldb` can read native Bedrock/LevelDB table, manifest, and WAL
 //! files and exposes lazy point lookups plus visitor-based scans over raw byte
-//! keys and values. The write APIs are intentionally limited: data written by
-//! this crate is stored in the crate's own `BWLDB...` table and manifest format
-//! for local tooling, not as native `LevelDB` output suitable for other engines.
+//! keys and values. The write path appends standard `LevelDB` write batches to
+//! WAL files and flushes native `.ldb` tables plus native manifest edits, while
+//! older crate-specific `BWLDB...` files remain readable for migration.
 //!
 //! # Logging
 //!
@@ -59,13 +59,15 @@ pub use batch::{WriteBatch, WriteOp};
 pub use bedrock::{
     BedrockKey, ChunkCoordinates, ChunkKey, ChunkRecordTag, Dimension,
     LEGACY_SUBCHUNK_MIN_VALUE_LEN, LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN,
-    LEGACY_TERRAIN_BLOCK_COUNT, LEGACY_TERRAIN_VALUE_LEN, LegacySubChunk, LegacyTerrain,
-    SUBCHUNK_BLOCK_COUNT, SubChunkIndex, SubChunkPayload,
+    LEGACY_TERRAIN_BLOCK_COUNT, LEGACY_TERRAIN_VALUE_LEN, LegacyBiomeSample, LegacySubChunk,
+    LegacyTerrain, SUBCHUNK_BLOCK_COUNT, SubChunkIndex, SubChunkPayload,
 };
-pub use db::{Db, DbStats, PrefixIterator, RawIterator, RepairReport, Snapshot};
+pub use db::{
+    Db, DbStats, EntryRef, KeyRef, PrefixIterator, RawIterator, RepairReport, Snapshot, ValueRef,
+};
 pub use error::{ErrorKind, LevelDbError, Result};
 pub use options::{
-    CachePolicy, ChecksumMode, CompressionPolicy, OpenOptions, ReadOptions, ScanCancelFlag,
-    ScanMode, ScanOutcome, ScanPipelineOptions, ScanProgress, ScanProgressSink, ThreadingOptions,
-    VisitorControl, WriteOptions,
+    CachePolicy, ChecksumMode, CompressionPolicy, OpenOptions, ReadOptions, ReadStrategy,
+    ScanCancelFlag, ScanMode, ScanOutcome, ScanPipelineOptions, ScanProgress, ScanProgressSink,
+    ThreadingOptions, VisitorControl, WriteOptions,
 };

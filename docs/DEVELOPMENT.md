@@ -15,11 +15,11 @@ semantics such as NBT interpretation, player records, actor models, chunk block
 state meaning, entity data, or world editing workflows. Those belong in
 applications or higher-level domain crates.
 
-The crate is read-first for native LevelDB. Native manifest, WAL, and table
-files are read directly. Writes provided by this crate are intentionally local
-tooling writes: flushed data uses the crate-specific `BWLDB...` table and
-manifest format. Do not present custom writes as native LevelDB-compatible
-output unless native compatibility has been implemented and tested.
+The crate is a raw native LevelDB engine layer. Native manifest, WAL, and table
+files are read directly. v0.2 writes standard LevelDB write batches to WAL,
+flushes native `.ldb` tables, and persists manifest version edits. Older
+`BWLDB...` files remain readable for migration/backward compatibility only; new
+write paths must not create the custom format.
 
 Bedrock helpers in `bedrock.rs` are storage-layout helpers only. They may parse
 documented LevelDB-era chunk keys and legacy payload layouts such as
@@ -33,10 +33,10 @@ semantics.
   policy.
 - `db.rs`: `Db`, open/recovery flow, point reads, scans, overlay, snapshots,
   flush, repair entry points, and read-only enforcement.
-- `manifest.rs`: native and custom manifest parsing plus table metadata used
+- `manifest.rs`: native manifest parsing, version edits, and table metadata used
   for range filtering.
 - `table.rs`: table footer, index/data block reads, restart arrays,
-  decompression, internal key handling, and custom table writing.
+  decompression, internal key handling, and native table writing.
 - `wal.rs`: LevelDB WAL record framing, fragmentation, checksums, and padding.
 - `coding.rs`: varints, fixed-width coding helpers, and CRC masking.
 - `options.rs`: open/read/write/scan option types and progress/cancel plumbing.
@@ -79,7 +79,7 @@ Callers should be able to match `err.kind()` and inspect `err.path()` without
 parsing `Display` output.
 
 Read-only mode is strict. A read-only handle must not create missing
-directories, repair files, flush, compact, write WAL records, or create custom
+directories, repair files, flush, compact, write WAL records, or create native
 tables. Any new mutating path must check read-only behavior and return
 `ErrorKind::ReadOnly`.
 
@@ -98,9 +98,14 @@ Important scenarios to preserve:
 - Missing and corrupt files carry path context in errors.
 - WAL replay handles fragmented records and tombstones.
 - Varint decoding rejects overflow and truncation.
-- Custom flush/reopen preserves keys, values, and deletions.
+- Native flush/reopen preserves keys, values, sequence numbers, and deletions.
 - Native table point reads and prefix scans honor manifest ranges and deletion
   records.
+- `ReadStrategy::Borrowed` callback scans return `ValueRef::Borrowed` for
+  uncompressed native blocks and legacy uncompressed `BWLDB...` compatibility
+  tables, and return `ValueRef::Shared` for compressed blocks.
+- `mmap` unsafe blocks have a local `SAFETY:` comment, remain feature-gated,
+  and expose mapped bytes only through callback lifetimes.
 - Sequential and table-parallel scans produce the same visible entries.
 - Feature-disabled compression reports a typed unsupported/compression error.
 - The library does not initialize a logger.
@@ -126,7 +131,7 @@ logger initialization in hot read measurements.
 The benchmark groups should stay explicit about what they measure:
 
 - Overlay hot path.
-- Flushed custom table point reads.
+- Flushed native table point reads.
 - Native table point reads and prefix scans.
 - WAL recovery.
 - Sequential versus table-parallel scans.

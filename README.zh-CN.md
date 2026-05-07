@@ -2,14 +2,13 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-`bedrock-leveldb` 是一个读优先的纯 Rust 原始 key/value 库，用于 Minecraft
+`bedrock-leveldb` 是一个纯 Rust 原始 key/value 存储库，用于 Minecraft
 Bedrock 世界数据库。它只处理存储层；区块、实体、玩家、NBT 等语义不在
 本库范围内，应由应用层或领域层处理。
 
 本 crate 可以读取 Bedrock/native LevelDB 的 manifest、WAL 和 table 文件。
-写入 API 的定位更保守：由本 crate 写入或 flush 的数据使用本 crate 自己的
-`BWLDB...` table/manifest 格式，不是可与其他 LevelDB 引擎互通的 native
-LevelDB 输出。
+v0.2 写入标准 LevelDB WAL batch，flush 原生 `.ldb` table，并持久化 manifest
+version edit。旧的 `BWLDB...` 文件仅作为迁移和向后兼容读取保留。
 
 维护者和贡献者请同时阅读[开发指南](docs/DEVELOPMENT.zh-CN.md)。
 
@@ -68,11 +67,12 @@ fn main() -> bedrock_leveldb::Result<()> {
 | Visitor scan | 支持 key、entry、prefix、顺序和 table-parallel 模式 |
 | native block cache | 有界 decoded block cache |
 | Bedrock chunk key helper | 解析和编码文档化的 LevelDB chunk key |
-| 旧版 `LegacyTerrain` value | 校验并暴露早期 LevelDB 的 83,200 字节 terrain 布局 |
+| 旧版 `LegacyTerrain` value | 校验并暴露早期 LevelDB 的 83,200 字节 terrain 布局，包括 `[biome_id, red, green, blue]` biome 样本 |
 | 旧版 subchunk value | 识别 paletted subchunk，并暴露 pre-paletted block ID/metadata 数组 |
-| 本 crate 写入 | 仅写入自定义 `BWLDB...` 格式 |
-| 生产级 LevelDB compaction | 未实现 |
-| 任意损坏数据库 repair | 部分实现，输出为自定义修复格式 |
+| 批量 exact read | `Db::get_many_owned` 保持输入顺序，适合旧版和新版渲染 key |
+| 本 crate 原生写入 | WAL batch append、原生 `.ldb` flush、manifest edit 持久化 |
+| 生产级 LevelDB compaction | correctness-first 原生 range compaction |
+| 任意损坏数据库 repair | 部分实现，从可读数据输出原生恢复结果 |
 | Pre-LevelDB world | 不支持；`chunks.dat` 和 `entities.dat` 不属于本 crate |
 | `mmap` 读取路径 | feature 预留；默认是 seeked file I/O |
 
@@ -82,6 +82,11 @@ fn main() -> bedrock_leveldb::Result<()> {
   不会急切物化所有 native table value。
 - `Db::get(key)` 使用默认读取选项；`Db::get_with(key, ReadOptions)` 可覆盖
   checksum 和 cache 策略。
+- `Db::get_many_owned(keys, ReadOptions)` 是渲染路径读取精确 chunk record 的推荐
+  接口，例如 `LegacyTerrain` (`0x30`)、`Data2D`、subchunk 和 block entity。
+  它保持输入顺序，避免 tile 渲染阶段退回 prefix scan。该接口按字节原样返回 value；
+  X/Y/Z 坐标解释与 legacy biome 优先级由 `bedrock-world`/`bedrock-render`
+  的测试和实现负责。
 - 默认 `async` feature 下，`Arc<Db>` 提供 owned async 读取接口：
   `get_async`、`get_with_async`、`collect_keys_owned_async`、
   `collect_prefix_keys_owned_async` 和 `collect_prefix_owned_async`。这些接口内部使用
@@ -89,10 +94,18 @@ fn main() -> bedrock_leveldb::Result<()> {
 - `Db::collect_keys_owned`、`Db::collect_prefix_keys_owned` 和
   `Db::collect_prefix_owned` 为常见索引路径直接返回 owned 数据，调用方不必手写
   visitor glue。
+- `Db::write_batch_native`、`Db::flush_memtable`、
+  `Db::compact_range_native` 和 `Db::recover_native` 是 v0.2 显式原生
+  写入/恢复入口。`Db::write`、`Db::flush`、`Db::compact_range` 和
+  `Db::repair` 委托到同一套原生路径。
 - `ReadOptions::pipeline` 控制本地 Rayon scan 调度。`queue_depth`、
   `table_batch_size` 和 `progress_interval` 为 0 时自动选择。`ScanOutcome`
   会报告 `tables_scanned`、`worker_threads`、`queue_wait_ms` 和 `cancel_checks`，
   便于按统计调优，而不是依赖跨机器固定耗时阈值。
+- 旧版 LevelDB 世界仍属于本 crate 的范围：支持 native zlib 压缩 tag `2`、
+  Bedrock raw deflate tag `4`、WAL + `.ldb` overlay，以及 exact
+  `LegacyTerrain` key。Pre-LevelDB 的 `chunks.dat` 解析由 `bedrock-world`
+  的只读后端负责。
 - `Db::for_each_key`、`Db::for_each_entry`、`Db::for_each_prefix` 以 visitor
   方式流式返回 borrowed key 和 `Bytes` value。
 - `Db::for_each_prefix_key` 是渲染索引推荐路径。只需要 key 时不再回调 value，
@@ -100,7 +113,7 @@ fn main() -> bedrock_leveldb::Result<()> {
 - visitor 返回 `VisitorControl::Continue` 或 `VisitorControl::Stop`；正常提前
   停止体现在 `ScanOutcome` 中，不作为错误返回。
 - `stats_fast()` 只读取元数据和 overlay；`stats_full()`、snapshot、物化
-  iterator、repair、自定义 compact 都是显式昂贵路径。
+  iterator、repair、compact 都是显式昂贵路径。
 
 ### 迁移：全量 prefix value 扫描到 key-only scan
 
@@ -186,7 +199,7 @@ fn main() -> bedrock_leveldb::Result<()> {
 ```
 
 日志事件保持低噪声，不记录 raw value。当前主要覆盖数据库打开、manifest/WAL
-replay、table scan、自定义 flush、repair 丢弃不可读文件、并行 worker、取消和
+replay、table scan、native flush、repair 丢弃不可读文件、并行 worker、取消和
 key-only prefix scan。使用 `tracing` 的应用可以通过 `tracing_log::LogTracer`
 接入这些日志。
 
@@ -216,14 +229,14 @@ assert!(error.path().is_some());
 ```
 
 协作式 scan 取消返回 `ErrorKind::Cancelled`。只读句柄在 write、flush、repair
-和自定义 compact 时返回 `ErrorKind::ReadOnly`。
+和 compact 时返回 `ErrorKind::ReadOnly`。
 
 ## Features
 
 | Feature | 默认 | 含义 |
 | --- | --- | --- |
-| `zlib` | 是 | 启用 zlib、Bedrock raw-deflate 解压，以及 zlib 自定义写入 |
-| `snappy` | 是 | 启用 Snappy table 解压，以及 Snappy 自定义写入 |
+| `zlib` | 是 | 启用 zlib、Bedrock raw-deflate 解压和压缩 |
+| `snappy` | 是 | 启用 Snappy table 解压和压缩 |
 | `async` | 是 | 通过 Tokio `spawn_blocking` 提供 `Db::open_async` |
 | `mmap` | 否 | 为未来 mapped read path 预留 |
 | `repair-tools` | 否 | 为更完整 repair 工具预留 |
@@ -250,27 +263,11 @@ cargo package --allow-dirty
 cargo bench --all-features
 ```
 
-Criterion suite 是合成 benchmark，会分开测 overlay hot read、flushed custom
+Criterion suite 是合成 benchmark，会分开测 overlay hot read、flushed native
 table read、native table point/prefix read、WAL recovery，以及顺序扫描和
 table-parallel 扫描。大型世界的真实性能仍建议在上层 crate 使用真实 Bedrock
-fixture 验证，因为本 crate 不解释世界 key 或 NBT payload。
-
-最近一次本地 benchmark：Windows，2026-05-01，rustc 1.93.1，Criterion
-sample size 10，measurement time 2 秒。由于未安装 `gnuplot`，Criterion 使用
-Plotters backend。native table benchmark 使用合成 native fixture，并关闭 decoded
-block cache。本次运行未安装 logger backend，也就是库的默认使用方式。
-
-```text
-bedrock_leveldb/write/batch_1000_overlay        [2.4738 ms 2.5905 ms 2.6781 ms]
-bedrock_leveldb/get_point/overlay_hot           [85.575 ns 86.229 ns 87.213 ns]
-bedrock_leveldb/get_point/custom_table          [4.5060 ms 4.6603 ms 4.9609 ms]
-bedrock_leveldb/get_point/native_table          [4.8687 ms 5.0016 ms 5.3457 ms]
-bedrock_leveldb/scan/custom_for_each_key        [4.3913 ms 4.4688 ms 4.6315 ms]
-bedrock_leveldb/scan/custom_for_each_entry      [4.5432 ms 4.6145 ms 4.7531 ms]
-bedrock_leveldb/scan/native_for_each_prefix     [6.2553 ms 6.4846 ms 6.6705 ms]
-bedrock_leveldb/scan/native_parallel_tables     [3.2028 ms 3.2548 ms 3.3292 ms]
-bedrock_leveldb/recover/wal_1000_overlay        [1.8688 ms 1.9349 ms 2.0575 ms]
-```
+fixture 验证，因为本 crate 不解释世界 key 或 NBT payload。最新本地结果记录在
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
 
 ## License
 

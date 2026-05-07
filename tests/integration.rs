@@ -1,6 +1,8 @@
 use bedrock_leveldb::{
-    ChecksumMode, CompressionPolicy, Db, ErrorKind, LevelDbError, OpenOptions, ReadOptions,
-    ScanCancelFlag, ScanMode, VisitorControl, WriteOptions,
+    ChecksumMode, ChunkCoordinates, ChunkKey, ChunkRecordTag, CompressionPolicy, Db, Dimension,
+    ErrorKind, LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN, LEGACY_TERRAIN_VALUE_LEN, LevelDbError,
+    OpenOptions, ReadOptions, ScanCancelFlag, ScanMode, SubChunkIndex, VisitorControl,
+    WriteOptions,
 };
 use bytes::Bytes;
 use std::sync::{Mutex, OnceLock};
@@ -118,6 +120,104 @@ fn read_only_handle_rejects_mutating_operations() {
 }
 
 #[test]
+fn get_many_owned_reads_render_record_keys_in_order() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let legacy_key = Bytes::from(
+        ChunkKey::new(
+            ChunkCoordinates::new(0, 0),
+            Dimension::Overworld,
+            ChunkRecordTag::LegacyTerrain,
+        )
+        .encode(),
+    );
+    let legacy_subchunk_key = Bytes::from(
+        ChunkKey::new_subchunk(
+            ChunkCoordinates::new(0, 0),
+            Dimension::Overworld,
+            SubChunkIndex::from_raw(0),
+        )
+        .encode(),
+    );
+    let modern_subchunk_key = Bytes::from(
+        ChunkKey::new_subchunk(
+            ChunkCoordinates::new(1, 0),
+            Dimension::Overworld,
+            SubChunkIndex::from_raw(0),
+        )
+        .encode(),
+    );
+    let other_key = Bytes::from_static(b"~local_player");
+    let terrain = Bytes::from(vec![7_u8; LEGACY_TERRAIN_VALUE_LEN]);
+    let mut legacy_subchunk_bytes = vec![0_u8; LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN];
+    legacy_subchunk_bytes[0] = 2;
+    legacy_subchunk_bytes[1 + 1_125] = 99;
+    let legacy_subchunk = Bytes::from(legacy_subchunk_bytes);
+    let modern_subchunk = Bytes::from_static(b"\x08\x00modern-paletted-fixture");
+    {
+        let db = Db::open(
+            temp.path(),
+            OpenOptions {
+                compression_policy: CompressionPolicy::None,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open writable");
+        db.put(legacy_key.clone(), terrain.clone(), WriteOptions::default())
+            .expect("put legacy terrain");
+        db.put(
+            legacy_subchunk_key.clone(),
+            legacy_subchunk.clone(),
+            WriteOptions::default(),
+        )
+        .expect("put legacy subchunk");
+        db.put(
+            modern_subchunk_key.clone(),
+            modern_subchunk.clone(),
+            WriteOptions::default(),
+        )
+        .expect("put modern subchunk");
+        db.put(
+            other_key.clone(),
+            b"player".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put other");
+        db.flush().expect("flush");
+    }
+
+    let db = Db::open(
+        temp.path(),
+        OpenOptions {
+            read_only: true,
+            create_if_missing: false,
+            compression_policy: CompressionPolicy::None,
+            ..OpenOptions::default()
+        },
+    )
+    .expect("open read-only");
+    let values = db
+        .get_many_owned(
+            vec![
+                Bytes::from_static(b"missing"),
+                legacy_key.clone(),
+                legacy_subchunk_key,
+                modern_subchunk_key,
+                other_key.clone(),
+                legacy_key,
+            ],
+            ReadOptions::default(),
+        )
+        .expect("get many");
+
+    assert!(values[0].is_none());
+    assert_eq!(values[1], Some(terrain.clone()));
+    assert_eq!(values[2], Some(legacy_subchunk));
+    assert_eq!(values[3], Some(modern_subchunk));
+    assert_eq!(values[4], Some(Bytes::from_static(b"player")));
+    assert_eq!(values[5], Some(terrain));
+}
+
+#[test]
 fn repair_rejects_read_only_options() {
     let temp = tempfile::tempdir().expect("tempdir");
     let missing = temp.path().join("repair-target");
@@ -156,7 +256,7 @@ fn delete_tombstone_survives_reopen() {
 }
 
 #[test]
-fn flushed_custom_table_reopens_and_scans() {
+fn flushed_native_table_reopens_and_scans() {
     let temp = tempfile::tempdir().expect("tempdir");
     let options = OpenOptions {
         compression_policy: CompressionPolicy::None,
@@ -194,10 +294,23 @@ fn flushed_custom_table_reopens_and_scans() {
     .expect("scan");
     values.sort();
     assert_eq!(values.len(), 2);
+
+    let table_path = std::fs::read_dir(temp.path())
+        .expect("read dir")
+        .map(|entry| entry.expect("entry").path())
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("ldb"))
+        .expect("native table file");
+    let table_bytes = std::fs::read(&table_path).expect("read native table");
+    assert_ne!(&table_bytes[..9], b"BWLDBTBL1");
+
+    let manifest_name = std::fs::read_to_string(temp.path().join("CURRENT")).expect("CURRENT");
+    let manifest_bytes =
+        std::fs::read(temp.path().join(manifest_name.trim())).expect("read manifest");
+    assert_ne!(&manifest_bytes[..9], b"BWLDBMAN1");
 }
 
 #[test]
-fn checksum_verification_detects_custom_table_corruption() {
+fn checksum_verification_detects_native_table_corruption() {
     let temp = tempfile::tempdir().expect("tempdir");
     let options = OpenOptions {
         compression_policy: CompressionPolicy::None,
@@ -353,7 +466,7 @@ fn parallel_scan_matches_sequential_scan_in_integration_path() {
 
 #[cfg(not(feature = "zlib"))]
 #[test]
-fn zlib_custom_writes_require_zlib_feature() {
+fn zlib_native_writes_require_zlib_feature() {
     let temp = tempfile::tempdir().expect("tempdir");
     let db = Db::open(
         temp.path(),
@@ -371,7 +484,7 @@ fn zlib_custom_writes_require_zlib_feature() {
 
 #[cfg(not(feature = "snappy"))]
 #[test]
-fn snappy_custom_writes_require_snappy_feature() {
+fn snappy_native_writes_require_snappy_feature() {
     let temp = tempfile::tempdir().expect("tempdir");
     let db = Db::open(
         temp.path(),

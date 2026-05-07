@@ -2,8 +2,8 @@ use crate::batch::{WriteBatch, WriteOp};
 use crate::error::{ErrorKind, LevelDbError, Result};
 use crate::manifest::Manifest;
 use crate::options::{
-    CachePolicy, ChecksumMode, OpenOptions, ReadOptions, ScanMode, ScanOutcome, VisitorControl,
-    WriteOptions,
+    CachePolicy, ChecksumMode, CompressionPolicy, OpenOptions, ReadOptions, ReadStrategy, ScanMode,
+    ScanOutcome, VisitorControl, WriteOptions,
 };
 use crate::table;
 use crate::wal;
@@ -88,6 +88,98 @@ impl IntoIterator for &Snapshot {
     }
 }
 
+/// Borrowed or shared key view returned by zero-copy-oriented APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyRef<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> KeyRef<'a> {
+    /// Creates a key view from raw bytes.
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    /// Returns the raw key bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+impl AsRef<[u8]> for KeyRef<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes
+    }
+}
+
+/// Value view used by borrowed-first read APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueRef<'a> {
+    /// Borrowed directly from a caller-owned or mapped buffer.
+    Borrowed(&'a [u8]),
+    /// Shared immutable bytes. This is used for overlay values and decoded
+    /// compressed blocks.
+    Shared(Bytes),
+    /// Explicitly materialized owned bytes.
+    Owned(Bytes),
+}
+
+impl ValueRef<'_> {
+    /// Returns the value bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Shared(bytes) | Self::Owned(bytes) => bytes.as_ref(),
+        }
+    }
+
+    /// Returns the value length in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    /// Returns whether this value is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.as_bytes().is_empty()
+    }
+
+    /// Materializes this value as [`Bytes`].
+    #[must_use]
+    pub fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Borrowed(bytes) => Bytes::copy_from_slice(bytes),
+            Self::Shared(bytes) | Self::Owned(bytes) => bytes,
+        }
+    }
+
+    fn from_shared(bytes: Bytes, strategy: ReadStrategy) -> Self {
+        match strategy {
+            ReadStrategy::Owned => Self::Owned(Bytes::copy_from_slice(&bytes)),
+            ReadStrategy::Borrowed | ReadStrategy::Shared => Self::Shared(bytes),
+        }
+    }
+}
+
+impl AsRef<[u8]> for ValueRef<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+/// Raw key/value entry view used by visitor-based scans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryRef<'a> {
+    /// Raw key bytes.
+    pub key: KeyRef<'a>,
+    /// Raw value bytes.
+    pub value: ValueRef<'a>,
+}
+
 /// Open database handle.
 pub struct Db {
     root: PathBuf,
@@ -96,10 +188,10 @@ pub struct Db {
     block_cache: table::NativeBlockCache,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DbInner {
-    overlay: BTreeMap<Vec<u8>, Option<Bytes>>,
-    manifest: Manifest,
+    overlay: Arc<BTreeMap<Vec<u8>, Option<Bytes>>>,
+    manifest: Arc<Manifest>,
     last_sequence: u64,
     approximate_bytes: usize,
 }
@@ -111,7 +203,7 @@ type LoadedState = (Manifest, Overlay, u64);
 // boundary so callers can use struct-update syntax without storing temporaries.
 #[allow(clippy::needless_pass_by_value)]
 impl Db {
-    /// Opens a Bedrock/native `LevelDB` directory or this crate's custom format.
+    /// Opens a Bedrock/native `LevelDB` directory.
     ///
     /// # Errors
     ///
@@ -163,8 +255,8 @@ impl Db {
             root,
             options,
             inner: RwLock::new(DbInner {
-                overlay,
-                manifest,
+                overlay: Arc::new(overlay),
+                manifest: Arc::new(manifest),
                 last_sequence,
                 approximate_bytes,
             }),
@@ -216,14 +308,38 @@ impl Db {
             .map_err(|error| LevelDbError::join(error.to_string()))?
     }
 
-    /// Reads a key using default [`ReadOptions`].
+    /// Reads a key using default [`ReadOptions`], materializing it as shared
+    /// [`Bytes`] for compatibility.
     ///
     /// # Errors
     ///
     /// Returns an error if metadata, table blocks, compression, or filesystem
     /// reads fail.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        self.get_with(key, ReadOptions::default())
+        self.get_owned(key)
+    }
+
+    /// Reads a key using default [`ReadOptions`] and returns a borrowed-first
+    /// value view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata, table blocks, compression, or filesystem
+    /// reads fail.
+    pub fn get_ref(&self, key: &[u8]) -> Result<Option<ValueRef<'static>>> {
+        self.get_with_ref(key, ReadOptions::default())
+    }
+
+    /// Reads a key and explicitly materializes it as [`Bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata, table blocks, compression, or filesystem
+    /// reads fail.
+    pub fn get_owned(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        Ok(self
+            .get_with_ref(key, ReadOptions::default())?
+            .map(ValueRef::into_bytes))
     }
 
     /// Reads a key using explicit [`ReadOptions`].
@@ -233,9 +349,27 @@ impl Db {
     /// Returns an error if metadata, table blocks, compression, checksum
     /// verification, or filesystem reads fail.
     pub fn get_with(&self, key: &[u8], options: ReadOptions) -> Result<Option<Bytes>> {
+        Ok(self.get_with_ref(key, options)?.map(ValueRef::into_bytes))
+    }
+
+    /// Reads a key using explicit [`ReadOptions`] and returns a borrowed-first
+    /// value view. The current safe default uses shared buffers for decoded
+    /// table blocks; future `mmap` paths can return [`ValueRef::Borrowed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata, table blocks, compression, checksum
+    /// verification, or filesystem reads fail.
+    pub fn get_with_ref(
+        &self,
+        key: &[u8],
+        options: ReadOptions,
+    ) -> Result<Option<ValueRef<'static>>> {
         let inner = self.read_inner()?;
         if let Some(value) = inner.overlay.get(key) {
-            return Ok(value.clone());
+            return Ok(value
+                .clone()
+                .map(|value| ValueRef::from_shared(value, options.read_strategy)));
         }
         for table in manifest_tables(&inner.manifest).iter().rev() {
             if !table.may_contain_user_key(key) {
@@ -251,10 +385,110 @@ impl Db {
                 read_checksums(&self.options, &options),
                 read_cache(&options, &self.block_cache),
             )? {
-                return Ok(Some(value));
+                return Ok(Some(ValueRef::from_shared(value, options.read_strategy)));
             }
         }
         Ok(None)
+    }
+
+    /// Reads many keys using explicit [`ReadOptions`], preserving input order.
+    ///
+    /// This batches keys by table file so native table indexes and data blocks
+    /// are reused across a render chunk read instead of reopened for each key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata, table blocks, compression, checksum
+    /// verification, or filesystem reads fail.
+    pub fn get_many_owned(
+        &self,
+        keys: impl IntoIterator<Item = Bytes>,
+        options: ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>> {
+        let started = Instant::now();
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inner = self.read_inner()?;
+        let mut results = vec![None; keys.len()];
+        let mut resolved = vec![false; keys.len()];
+        for (index, key) in keys.iter().enumerate() {
+            if let Some(value) = inner.overlay.get(key.as_ref()) {
+                results[index].clone_from(value);
+                resolved[index] = true;
+            }
+        }
+
+        let mut table_probes = 0usize;
+        let mut table_hits = 0usize;
+        for table in manifest_tables(&inner.manifest).iter().rev() {
+            let candidate_indexes = keys
+                .iter()
+                .enumerate()
+                .filter_map(|(index, key)| {
+                    (!resolved[index] && table.may_contain_user_key(key.as_ref())).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if candidate_indexes.is_empty() {
+                continue;
+            }
+            let table_path = self.root.join(Manifest::table_name(table.number));
+            if !table_path.exists() {
+                continue;
+            }
+            table_probes = table_probes.saturating_add(1);
+            let table_keys = candidate_indexes
+                .iter()
+                .map(|index| keys[*index].clone())
+                .collect::<Vec<_>>();
+            let table_results = table::get_table_entries(
+                &table_path,
+                &table_keys,
+                read_checksums(&self.options, &options),
+                read_cache(&options, &self.block_cache),
+            )?;
+            for (candidate_index, value) in candidate_indexes.into_iter().zip(table_results) {
+                if let Some(value) = value {
+                    results[candidate_index] = Some(value);
+                    resolved[candidate_index] = true;
+                    table_hits = table_hits.saturating_add(1);
+                }
+            }
+            if resolved.iter().all(|resolved| *resolved) {
+                break;
+            }
+        }
+        log::debug!(
+            "batch exact get complete (keys={}, hits={}, table_probes={}, elapsed_ms={})",
+            keys.len(),
+            results.iter().filter(|value| value.is_some()).count(),
+            table_probes,
+            started.elapsed().as_millis()
+        );
+        log::trace!(
+            "batch exact get detail (keys={}, table_hits={}, unresolved={})",
+            keys.len(),
+            table_hits,
+            resolved.iter().filter(|resolved| !**resolved).count()
+        );
+        Ok(results)
+    }
+
+    #[cfg(feature = "async")]
+    /// Reads many keys on a blocking Tokio task, preserving input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Db::get_many_owned`] plus a join error.
+    pub async fn get_many_owned_async(
+        self: Arc<Self>,
+        keys: Vec<Bytes>,
+        options: ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>> {
+        tokio::task::spawn_blocking(move || self.get_many_owned(keys, options))
+            .await
+            .map_err(|error| LevelDbError::join(error.to_string()))?
     }
 
     /// Appends a single put operation to the WAL overlay.
@@ -286,7 +520,8 @@ impl Db {
         self.write(batch, options)
     }
 
-    /// Appends a batch to the WAL overlay and flushes when the write buffer fills.
+    /// Appends a batch to the native `LevelDB` WAL overlay and flushes when the
+    /// write buffer fills.
     ///
     /// # Errors
     ///
@@ -315,13 +550,27 @@ impl Db {
         batch.set_sequence(first_sequence);
         append_batch_to_log(&self.root, inner.manifest.log_number, &batch, options)?;
         let approximate_bytes = inner.approximate_bytes;
-        inner.approximate_bytes = apply_batch(&mut inner.overlay, &batch, approximate_bytes);
+        inner.approximate_bytes =
+            apply_batch(Arc::make_mut(&mut inner.overlay), &batch, approximate_bytes);
         inner.last_sequence = last_sequence;
 
         if inner.approximate_bytes >= self.options.write_buffer_size {
             self.flush_locked(&mut inner)?;
         }
         Ok(())
+    }
+
+    /// Appends a batch through the native `LevelDB` write path.
+    ///
+    /// This is the explicit v0.2 name for [`Db::write`]. It writes a standard
+    /// `LevelDB` WAL batch and any automatic flush writes native `.ldb` tables
+    /// plus a native manifest version edit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Db::write`].
+    pub fn write_batch_native(&self, batch: WriteBatch, options: WriteOptions) -> Result<()> {
+        self.write(batch, options)
     }
 
     /// Visits visible keys without cloning values.
@@ -372,6 +621,35 @@ impl Db {
         result
     }
 
+    /// Visits visible entries as borrowed-first [`EntryRef`] values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when scan cancellation is requested, an underlying table
+    /// cannot be read, checksum or compression validation fails, thread options
+    /// are invalid, or the visitor returns an error.
+    pub fn for_each_entry_ref<F>(&self, options: ReadOptions, mut visitor: F) -> Result<ScanOutcome>
+    where
+        F: FnMut(EntryRef<'_>) -> Result<VisitorControl> + Send,
+    {
+        if options.read_strategy == ReadStrategy::Borrowed
+            && options.scan_mode == ScanMode::Sequential
+        {
+            let started = Instant::now();
+            let inner = self.read_inner()?;
+            let result = self.for_each_entry_ref_locked(&inner, &options, &mut visitor);
+            log_scan_result("entry ref scan", started, &result);
+            return result;
+        }
+        let strategy = options.read_strategy;
+        self.for_each_entry(options, |key, value| {
+            visitor(EntryRef {
+                key: KeyRef::new(key),
+                value: ValueRef::from_shared(value.clone(), strategy),
+            })
+        })
+    }
+
     /// Visits visible key/value entries whose key starts with `prefix`.
     ///
     /// # Errors
@@ -400,6 +678,40 @@ impl Db {
         let result = self.for_each_prefix_locked(&inner, prefix, &options, &mut visitor);
         log_scan_result("prefix entry scan", started, &result);
         result
+    }
+
+    /// Visits visible prefix entries as borrowed-first [`EntryRef`] values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when scan cancellation is requested, an underlying table
+    /// cannot be read, checksum or compression validation fails, thread options
+    /// are invalid, or the visitor returns an error.
+    pub fn for_each_prefix_ref<F>(
+        &self,
+        prefix: &[u8],
+        options: ReadOptions,
+        mut visitor: F,
+    ) -> Result<ScanOutcome>
+    where
+        F: FnMut(EntryRef<'_>) -> Result<VisitorControl> + Send,
+    {
+        if options.read_strategy == ReadStrategy::Borrowed
+            && options.scan_mode == ScanMode::Sequential
+        {
+            let started = Instant::now();
+            let inner = self.read_inner()?;
+            let result = self.for_each_prefix_ref_locked(&inner, prefix, &options, &mut visitor);
+            log_scan_result("prefix entry ref scan", started, &result);
+            return result;
+        }
+        let strategy = options.read_strategy;
+        self.for_each_prefix(prefix, options, |key, value| {
+            visitor(EntryRef {
+                key: KeyRef::new(key),
+                value: ValueRef::from_shared(value.clone(), strategy),
+            })
+        })
     }
 
     /// Visits visible keys whose key starts with `prefix` without materializing
@@ -626,9 +938,7 @@ impl Db {
         })
     }
 
-    /// Flushes the overlay into this crate's custom table format.
-    ///
-    /// This does not write native `LevelDB` tables.
+    /// Flushes the WAL overlay into a native `LevelDB` table.
     ///
     /// # Errors
     ///
@@ -642,9 +952,16 @@ impl Db {
         self.flush_locked(&mut inner)
     }
 
-    /// Flushes a range into a new custom table.
+    /// Flushes the current memtable/overlay into a native `LevelDB` table.
     ///
-    /// This is not production `LevelDB` compaction.
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Db::flush`].
+    pub fn flush_memtable(&self) -> Result<()> {
+        self.flush()
+    }
+
+    /// Flushes a range into a new native `LevelDB` table.
     ///
     /// # Errors
     ///
@@ -670,19 +987,39 @@ impl Db {
             .range(range)
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let table_number = allocate_file_number(&mut inner.manifest);
+        let last_sequence = inner.last_sequence;
+        let manifest = Arc::make_mut(&mut inner.manifest);
+        let table_number = allocate_file_number(manifest);
         let table_path = self.root.join(Manifest::table_name(table_number));
-        table::write_table(&table_path, &compacted, self.options.compression_policy)?;
-        inner.manifest.table_numbers.push(table_number);
-        inner
-            .manifest
+        let written = table::write_native_table(
+            &table_path,
+            &compacted,
+            last_sequence,
+            self.options.compression_policy,
+        )?;
+        manifest.table_numbers.push(table_number);
+        manifest
             .table_files
-            .push(crate::manifest::TableFileMeta::without_range(table_number));
-        inner.manifest.store(&self.root)?;
+            .push(crate::manifest::TableFileMeta::native(
+                table_number,
+                written.file_size,
+                written.smallest_internal_key,
+                written.largest_internal_key,
+            ));
+        manifest.store(&self.root)?;
         Ok(())
     }
 
-    /// Rebuilds this crate's custom manifest/table from readable tables and logs.
+    /// Flushes a range into a new native `LevelDB` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Db::compact_range`].
+    pub fn compact_range_native(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+        self.compact_range(start, end)
+    }
+
+    /// Rebuilds a native manifest/table from readable tables and logs.
     ///
     /// # Errors
     ///
@@ -755,32 +1092,7 @@ impl Db {
             }
         }
 
-        table_numbers.sort_unstable();
-        table_numbers.dedup();
-        let next_file_number = table_numbers
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(1)
-            .saturating_add(2);
-        let repaired_table = next_file_number.saturating_sub(1);
-        table::write_table(
-            &root.join(Manifest::table_name(repaired_table)),
-            &values,
-            options.compression_policy,
-        )?;
-        let manifest = Manifest {
-            next_file_number,
-            log_number: next_file_number,
-            table_numbers: vec![repaired_table],
-            table_files: vec![crate::manifest::TableFileMeta::without_range(
-                repaired_table,
-            )],
-        };
-        manifest.store(root)?;
-        let repaired_log = root.join(Manifest::log_name(manifest.log_number));
-        File::create(&repaired_log)
-            .map_err(|error| LevelDbError::io_at("create repaired WAL", &repaired_log, error))?;
+        write_recovered_native_state(root, &values, table_numbers, options.compression_policy)?;
         log::debug!(
             "repaired database at {} (tables={}, log_records={}, dropped_files={})",
             root.display(),
@@ -789,6 +1101,15 @@ impl Db {
             report.dropped_files
         );
         Ok(report)
+    }
+
+    /// Rebuilds a native manifest/table from readable tables and logs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Db::repair`].
+    pub fn recover_native(path: impl AsRef<Path>, options: OpenOptions) -> Result<RepairReport> {
+        Self::repair(path, options)
     }
 
     /// Returns metadata and overlay-only stats without table scans.
@@ -836,15 +1157,23 @@ impl Db {
     }
 
     fn flush_locked(&self, inner: &mut DbInner) -> Result<()> {
-        let table_number = allocate_file_number(&mut inner.manifest);
+        let table_number = {
+            let manifest = Arc::make_mut(&mut inner.manifest);
+            allocate_file_number(manifest)
+        };
         let table_path = self.root.join(Manifest::table_name(table_number));
         let values = self.collect_visible_entries_locked(inner, &ReadOptions::default())?;
         log::debug!(
-            "flushing custom table {} with {} visible entries",
+            "flushing native table {} with {} visible entries",
             table_path.display(),
             values.len()
         );
-        table::write_table(&table_path, &values, self.options.compression_policy)?;
+        let written = table::write_native_table(
+            &table_path,
+            &values,
+            inner.last_sequence,
+            self.options.compression_policy,
+        )?;
 
         for old_table in &inner.manifest.table_numbers {
             let old_path = self.root.join(Manifest::table_name(*old_table));
@@ -857,16 +1186,19 @@ impl Db {
         let old_log = self
             .root
             .join(Manifest::log_name(inner.manifest.log_number));
-        inner.manifest.table_numbers = vec![table_number];
-        inner.manifest.table_files =
-            vec![crate::manifest::TableFileMeta::without_range(table_number)];
-        inner.overlay.clear();
+        let manifest = Arc::make_mut(&mut inner.manifest);
+        manifest.table_numbers = vec![table_number];
+        manifest.table_files = vec![crate::manifest::TableFileMeta::native(
+            table_number,
+            written.file_size,
+            written.smallest_internal_key,
+            written.largest_internal_key,
+        )];
+        Arc::make_mut(&mut inner.overlay).clear();
         inner.approximate_bytes = 0;
-        inner.manifest.log_number = allocate_file_number(&mut inner.manifest);
-        inner.manifest.store(&self.root)?;
-        let new_log = self
-            .root
-            .join(Manifest::log_name(inner.manifest.log_number));
+        manifest.log_number = allocate_file_number(manifest);
+        manifest.store(&self.root)?;
+        let new_log = self.root.join(Manifest::log_name(manifest.log_number));
         File::create(&new_log)
             .map_err(|error| LevelDbError::io_at("create WAL", &new_log, error))?;
         if old_log.exists() {
@@ -874,7 +1206,7 @@ impl Db {
                 .map_err(|error| LevelDbError::io_at("remove old WAL", &old_log, error))?;
         }
         log::debug!(
-            "flushed custom table {} and advanced WAL to {}",
+            "flushed native table {} and advanced WAL to {}",
             table_path.display(),
             new_log.display()
         );
@@ -950,7 +1282,7 @@ impl Db {
                 }
             }
         }
-        for (key, value) in &inner.overlay {
+        for (key, value) in inner.overlay.iter() {
             check_scan_cancelled(options)?;
             if let Some(value) = value {
                 outcome.record(value.len());
@@ -1033,6 +1365,119 @@ impl Db {
             if let Some(value) = value {
                 outcome.record(value.len());
                 if visitor(key, value)? == VisitorControl::Stop {
+                    outcome.stopped = true;
+                    return Ok(outcome);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn for_each_entry_ref_locked<F>(
+        &self,
+        inner: &DbInner,
+        options: &ReadOptions,
+        visitor: &mut F,
+    ) -> Result<ScanOutcome>
+    where
+        F: FnMut(EntryRef<'_>) -> Result<VisitorControl> + Send,
+    {
+        let hidden_keys = inner.overlay.keys().cloned().collect::<BTreeSet<_>>();
+        let verify_checksums = read_checksums(&self.options, options);
+        let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = 1;
+        for table_number in &inner.manifest.table_numbers {
+            check_scan_cancelled(options)?;
+            let table_path = self.root.join(Manifest::table_name(*table_number));
+            if !table_path.exists() {
+                continue;
+            }
+            let table_outcome =
+                table::for_each_table_entry_ref(&table_path, verify_checksums, |key, value| {
+                    if !hidden_keys.contains(key) {
+                        return visitor(EntryRef {
+                            key: KeyRef::new(key),
+                            value,
+                        });
+                    }
+                    Ok(VisitorControl::Continue)
+                })?;
+            outcome.merge(table_outcome);
+            emit_scan_progress(options, outcome);
+            if outcome.stopped {
+                return Ok(outcome);
+            }
+        }
+        for (key, value) in inner.overlay.iter() {
+            check_scan_cancelled(options)?;
+            if let Some(value) = value {
+                outcome.record(value.len());
+                if visitor(EntryRef {
+                    key: KeyRef::new(key),
+                    value: ValueRef::Shared(value.clone()),
+                })? == VisitorControl::Stop
+                {
+                    outcome.stopped = true;
+                    return Ok(outcome);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn for_each_prefix_ref_locked<F>(
+        &self,
+        inner: &DbInner,
+        prefix: &[u8],
+        options: &ReadOptions,
+        visitor: &mut F,
+    ) -> Result<ScanOutcome>
+    where
+        F: FnMut(EntryRef<'_>) -> Result<VisitorControl> + Send,
+    {
+        let hidden_keys = inner.overlay.keys().cloned().collect::<BTreeSet<_>>();
+        let verify_checksums = read_checksums(&self.options, options);
+        let mut outcome = ScanOutcome::empty();
+        outcome.worker_threads = 1;
+        for table_number in &inner.manifest.table_numbers {
+            check_scan_cancelled(options)?;
+            let table_path = self.root.join(Manifest::table_name(*table_number));
+            if !table_path.exists() {
+                continue;
+            }
+            let table_outcome = table::for_each_table_prefix_ref(
+                &table_path,
+                prefix,
+                verify_checksums,
+                |key, value| {
+                    if !hidden_keys.contains(key) {
+                        return visitor(EntryRef {
+                            key: KeyRef::new(key),
+                            value,
+                        });
+                    }
+                    Ok(VisitorControl::Continue)
+                },
+            )?;
+            outcome.merge(table_outcome);
+            emit_scan_progress(options, outcome);
+            if outcome.stopped {
+                return Ok(outcome);
+            }
+        }
+        for (key, value) in inner
+            .overlay
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            check_scan_cancelled(options)?;
+            if let Some(value) = value {
+                outcome.record(value.len());
+                if visitor(EntryRef {
+                    key: KeyRef::new(key),
+                    value: ValueRef::Shared(value.clone()),
+                })? == VisitorControl::Stop
+                {
                     outcome.stopped = true;
                     return Ok(outcome);
                 }
@@ -1194,7 +1639,7 @@ impl Db {
                 }
             }
         }
-        for (key, value) in &inner.overlay {
+        for (key, value) in inner.overlay.iter() {
             check_scan_cancelled(options)?;
             if let Some(value) = value {
                 outcome.record(value.len());
@@ -1274,7 +1719,7 @@ impl Db {
             }
         }
         let mut overlay_partition = init();
-        for (key, value) in &inner.overlay {
+        for (key, value) in inner.overlay.iter() {
             check_scan_cancelled(options)?;
             if let Some(value) = value {
                 outcome.record(value.len());
@@ -1355,7 +1800,7 @@ impl Db {
             }
         }
         let mut overlay_partition = init();
-        for (key, value) in &inner.overlay {
+        for (key, value) in inner.overlay.iter() {
             check_scan_cancelled(options)?;
             if let Some(value) = value {
                 outcome.record(value.len());
@@ -1401,10 +1846,11 @@ impl Db {
         Ok(entries)
     }
 
-    fn read_inner(&self) -> Result<std::sync::RwLockReadGuard<'_, DbInner>> {
+    fn read_inner(&self) -> Result<DbInner> {
         self.inner
             .read()
             .map_err(|_| LevelDbError::lock_poisoned("acquiring database read lock"))
+            .map(|inner| inner.clone())
     }
 
     fn write_inner(&self) -> Result<std::sync::RwLockWriteGuard<'_, DbInner>> {
@@ -1505,7 +1951,10 @@ fn load_existing_or_initialize(root: &Path, options: &OpenOptions) -> Result<Loa
                 && options.create_if_missing
                 && !options.read_only =>
         {
-            log::debug!("initializing new custom database at {}", root.display());
+            log::debug!(
+                "initializing new native LevelDB database at {}",
+                root.display()
+            );
             let manifest = Manifest::default();
             manifest.store(root)?;
             let log_path = root.join(Manifest::log_name(manifest.log_number));
@@ -1539,6 +1988,55 @@ fn append_batch_to_log(
         file.sync_data()
             .map_err(|error| LevelDbError::io_at("sync WAL", &log_path, error))?;
     }
+    Ok(())
+}
+
+fn write_recovered_native_state(
+    root: &Path,
+    values: &BTreeMap<Vec<u8>, Bytes>,
+    mut table_numbers: Vec<u64>,
+    compression: CompressionPolicy,
+) -> Result<()> {
+    table_numbers.sort_unstable();
+    table_numbers.dedup();
+    let next_file_number = table_numbers
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .saturating_add(2);
+    let repaired_table = next_file_number.saturating_sub(1);
+    let table_files = if values.is_empty() {
+        Vec::new()
+    } else {
+        let written = table::write_native_table(
+            &root.join(Manifest::table_name(repaired_table)),
+            values,
+            next_file_number,
+            compression,
+        )?;
+        vec![crate::manifest::TableFileMeta::native(
+            repaired_table,
+            written.file_size,
+            written.smallest_internal_key,
+            written.largest_internal_key,
+        )]
+    };
+    let table_numbers = if table_files.is_empty() {
+        Vec::new()
+    } else {
+        vec![repaired_table]
+    };
+    let manifest = Manifest {
+        next_file_number,
+        log_number: next_file_number,
+        table_numbers,
+        table_files,
+    };
+    manifest.store(root)?;
+    let repaired_log = root.join(Manifest::log_name(manifest.log_number));
+    File::create(&repaired_log)
+        .map_err(|error| LevelDbError::io_at("create repaired WAL", &repaired_log, error))?;
     Ok(())
 }
 
@@ -1792,6 +2290,7 @@ fn partition_paths_by_size(table_paths: Vec<PathBuf>, worker_count: usize) -> Ve
 // The parallel helpers keep their call sites explicit because each parameter is
 // a separate scan policy; grouping them did not make the ownership easier.
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)]
 fn for_each_table_paths_parallel<F>(
     table_paths: Vec<PathBuf>,
     prefix: Option<Vec<u8>>,
@@ -2048,6 +2547,7 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn for_each_table_prefix_key_paths_parallel<F>(
     table_paths: Vec<PathBuf>,
     prefix: Vec<u8>,
@@ -2102,7 +2602,7 @@ where
                 );
                 for path in paths {
                     if cancelled.load(Ordering::Relaxed) {
-                        log::trace!("prefix key scan worker {} cancelled", worker_index);
+                        log::trace!("prefix key scan worker {worker_index} cancelled");
                         return;
                     }
                     let scan_result = table::for_each_table_prefix_key(
@@ -2142,7 +2642,7 @@ where
                         }
                     }
                 }
-                log::trace!("prefix key scan worker {} finished", worker_index);
+                log::trace!("prefix key scan worker {worker_index} finished");
             });
         }
         drop(sender);
@@ -2399,7 +2899,6 @@ where
 mod tests {
     use super::*;
     use crate::options::{CompressionPolicy, ScanCancelFlag};
-    #[cfg(feature = "async")]
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2569,6 +3068,218 @@ mod tests {
                 (Bytes::from_static(b"chunk_b"), Bytes::from_static(b"two")),
             ]
         );
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[test]
+    fn borrowed_first_read_api_exposes_entry_refs_without_owned_collection() {
+        let path = temp_dir("entry-ref-api");
+        let db = Db::open(
+            &path,
+            OpenOptions {
+                compression_policy: CompressionPolicy::None,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open");
+        db.put(
+            b"chunk_a".as_slice(),
+            b"one".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put a");
+        db.put(
+            b"chunk_b".as_slice(),
+            b"two".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put b");
+        db.flush().expect("flush");
+
+        let value = db
+            .get_with_ref(
+                b"chunk_a",
+                ReadOptions {
+                    read_strategy: crate::options::ReadStrategy::Shared,
+                    ..ReadOptions::default()
+                },
+            )
+            .expect("get ref")
+            .expect("value");
+        assert_eq!(value.as_bytes(), b"one");
+
+        let owned = db
+            .get_with_ref(
+                b"chunk_a",
+                ReadOptions {
+                    read_strategy: crate::options::ReadStrategy::Owned,
+                    ..ReadOptions::default()
+                },
+            )
+            .expect("get owned ref")
+            .expect("value");
+        assert!(matches!(owned, ValueRef::Owned(_)));
+
+        let mut entries = Vec::new();
+        db.for_each_prefix_ref(b"chunk_", ReadOptions::default(), |entry| {
+            entries.push((
+                Bytes::copy_from_slice(entry.key.as_bytes()),
+                Bytes::copy_from_slice(entry.value.as_bytes()),
+            ));
+            Ok(VisitorControl::Continue)
+        })
+        .expect("prefix refs");
+        assert_eq!(
+            entries,
+            vec![
+                (Bytes::from_static(b"chunk_a"), Bytes::from_static(b"one")),
+                (Bytes::from_static(b"chunk_b"), Bytes::from_static(b"two")),
+            ]
+        );
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[test]
+    fn borrowed_strategy_scans_uncompressed_custom_table_as_borrowed() {
+        let path = temp_dir("borrowed-uncompressed");
+        let db = Db::open(
+            &path,
+            OpenOptions {
+                compression_policy: CompressionPolicy::None,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open");
+        db.put(
+            b"chunk_a".as_slice(),
+            b"one".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put a");
+        db.put(
+            b"chunk_b".as_slice(),
+            b"two".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put b");
+        db.flush().expect("flush");
+
+        let mut borrowed = 0usize;
+        let mut values = Vec::new();
+        db.for_each_prefix_ref(
+            b"chunk_",
+            ReadOptions {
+                read_strategy: ReadStrategy::Borrowed,
+                scan_mode: ScanMode::Sequential,
+                ..ReadOptions::default()
+            },
+            |entry| {
+                if matches!(entry.value, ValueRef::Borrowed(_)) {
+                    borrowed = borrowed.saturating_add(1);
+                }
+                values.push(Bytes::copy_from_slice(entry.value.as_bytes()));
+                Ok(VisitorControl::Continue)
+            },
+        )
+        .expect("borrowed prefix scan");
+
+        assert_eq!(
+            values,
+            vec![Bytes::from_static(b"one"), Bytes::from_static(b"two")]
+        );
+        assert_eq!(borrowed, 2);
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[cfg(feature = "zlib")]
+    #[test]
+    fn borrowed_strategy_keeps_compressed_custom_table_values_shared() {
+        let path = temp_dir("borrowed-compressed");
+        let db = Db::open(
+            &path,
+            OpenOptions {
+                compression_policy: CompressionPolicy::Zlib,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open");
+        db.put(
+            b"chunk_a".as_slice(),
+            b"one".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put a");
+        db.put(
+            b"chunk_b".as_slice(),
+            b"two".as_slice(),
+            WriteOptions::default(),
+        )
+        .expect("put b");
+        db.flush().expect("flush");
+
+        let mut shared = 0usize;
+        db.for_each_prefix_ref(
+            b"chunk_",
+            ReadOptions {
+                read_strategy: ReadStrategy::Borrowed,
+                scan_mode: ScanMode::Sequential,
+                ..ReadOptions::default()
+            },
+            |entry| {
+                if matches!(entry.value, ValueRef::Shared(_)) {
+                    shared = shared.saturating_add(1);
+                }
+                Ok(VisitorControl::Continue)
+            },
+        )
+        .expect("compressed prefix scan");
+
+        assert_eq!(shared, 2);
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[test]
+    fn read_state_snapshot_allows_concurrent_lock_free_table_reads() {
+        let path = temp_dir("concurrent-reads");
+        let db = Arc::new(
+            Db::open(
+                &path,
+                OpenOptions {
+                    compression_policy: CompressionPolicy::None,
+                    ..OpenOptions::default()
+                },
+            )
+            .expect("open"),
+        );
+        let mut batch = WriteBatch::new();
+        for index in 0..64 {
+            batch.put(
+                Bytes::from(format!("key:{index:03}")),
+                Bytes::from(format!("value:{index:03}")),
+            );
+        }
+        db.write(batch, WriteOptions::default()).expect("write");
+        db.flush().expect("flush");
+
+        let handles = (0..8)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                std::thread::spawn(move || {
+                    for index in 0..64 {
+                        let key = format!("key:{index:03}");
+                        let value = db
+                            .get_ref(key.as_bytes())
+                            .expect("get")
+                            .expect("value")
+                            .into_bytes();
+                        assert_eq!(value, Bytes::from(format!("value:{index:03}")));
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("reader thread");
+        }
         std::fs::remove_dir_all(path).expect("cleanup");
     }
 

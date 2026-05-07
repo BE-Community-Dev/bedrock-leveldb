@@ -52,6 +52,15 @@ pub(crate) fn get_varint64(input: &mut &[u8]) -> Result<u64> {
     Err(LevelDbError::corruption("varint64 is too long".to_string()))
 }
 
+pub(crate) fn put_varint64(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        let byte = u8::try_from(value & 0x7f).expect("masked varint64 byte fits in u8");
+        out.push(byte | 0x80);
+        value >>= 7;
+    }
+    out.push(u8::try_from(value).expect("final varint64 byte fits in u8"));
+}
+
 pub(crate) fn put_length_prefixed_slice(value: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let len = u32::try_from(value.len())
         .map_err(|_| LevelDbError::invalid_argument("slice is too large".to_string()))?;
@@ -111,15 +120,6 @@ pub(crate) const fn unmask_crc(masked: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn put_varint64(mut value: u64, out: &mut Vec<u8>) {
-        while value >= 0x80 {
-            let byte = u8::try_from(value & 0x7f).expect("masked varint64 byte fits in u8");
-            out.push(byte | 0x80);
-            value >>= 7;
-        }
-        out.push(u8::try_from(value).expect("final varint64 byte fits in u8"));
-    }
 
     #[test]
     fn varint_roundtrips() {

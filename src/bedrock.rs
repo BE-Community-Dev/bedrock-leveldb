@@ -142,6 +142,12 @@ impl SubChunkIndex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ChunkRecordTag {
+    /// `Data3D` terrain and biome record used by modern worlds.
+    Data3D,
+    /// `Data2D` heightmap and biome record.
+    Data2D,
+    /// Legacy `Data2D` terrain support record.
+    Data2DLegacy,
     /// `SubChunkPrefix` terrain record, one value per 16x16x16 subchunk.
     SubChunkPrefix,
     /// `LegacyTerrain` terrain record used by early `LevelDB` worlds.
@@ -155,6 +161,9 @@ impl ChunkRecordTag {
     #[must_use]
     pub const fn from_byte(byte: u8) -> Self {
         match byte {
+            0x2b => Self::Data3D,
+            0x2d => Self::Data2D,
+            0x2e => Self::Data2DLegacy,
             0x2f => Self::SubChunkPrefix,
             0x30 => Self::LegacyTerrain,
             other => Self::Unknown(other),
@@ -165,10 +174,26 @@ impl ChunkRecordTag {
     #[must_use]
     pub const fn as_byte(self) -> u8 {
         match self {
+            Self::Data3D => 0x2b,
+            Self::Data2D => 0x2d,
+            Self::Data2DLegacy => 0x2e,
             Self::SubChunkPrefix => 0x2f,
             Self::LegacyTerrain => 0x30,
             Self::Unknown(byte) => byte,
         }
+    }
+
+    /// Returns whether this record can make a chunk renderable.
+    #[must_use]
+    pub const fn is_render_chunk_record(self) -> bool {
+        matches!(
+            self,
+            Self::Data3D
+                | Self::Data2D
+                | Self::Data2DLegacy
+                | Self::SubChunkPrefix
+                | Self::LegacyTerrain
+        )
     }
 }
 
@@ -272,6 +297,30 @@ impl ChunkKey {
     }
 }
 
+/// A decoded legacy biome column sample from the 1024-byte `LegacyTerrain`
+/// biome tail.
+///
+/// Old Bedrock stores each column as `[biome_id, red, green, blue]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyBiomeSample {
+    /// Numeric biome ID stored by the old world.
+    pub biome_id: u8,
+    /// Red tint channel.
+    pub red: u8,
+    /// Green tint channel.
+    pub green: u8,
+    /// Blue tint channel.
+    pub blue: u8,
+}
+
+impl LegacyBiomeSample {
+    /// Returns the RGB channels as `0x00RRGGBB`.
+    #[must_use]
+    pub const fn rgb_u32(self) -> u32 {
+        ((self.red as u32) << 16) | ((self.green as u32) << 8) | self.blue as u32
+    }
+}
+
 /// Parsed legacy 16x128x16 terrain value.
 #[derive(Debug, Clone, Copy)]
 pub struct LegacyTerrain<'a> {
@@ -331,7 +380,8 @@ impl<'a> LegacyTerrain<'a> {
         &self.bytes[LEGACY_TERRAIN_HEIGHTMAP_OFFSET..LEGACY_TERRAIN_BIOME_OFFSET]
     }
 
-    /// Returns the 16x16 biome color values.
+    /// Returns the 16x16 biome samples as raw `[biome_id, red, green, blue]`
+    /// bytes.
     #[must_use]
     pub fn biomes(self) -> &'a [u8] {
         &self.bytes[LEGACY_TERRAIN_BIOME_OFFSET..LEGACY_TERRAIN_VALUE_LEN]
@@ -341,7 +391,17 @@ impl<'a> LegacyTerrain<'a> {
     #[must_use]
     pub const fn block_index(x: u8, y: u8, z: u8) -> Option<usize> {
         if x < 16 && y < 128 && z < 16 {
-            Some((y as usize * 16 + z as usize) * 16 + x as usize)
+            Some(((x as usize) << 11) | ((z as usize) << 7) | y as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the linear index for a local height/biome column.
+    #[must_use]
+    pub const fn column_index(x: u8, z: u8) -> Option<usize> {
+        if x < 16 && z < 16 {
+            Some(x as usize * 16 + z as usize)
         } else {
             None
         }
@@ -357,6 +417,32 @@ impl<'a> LegacyTerrain<'a> {
     #[must_use]
     pub fn block_data_at(self, x: u8, y: u8, z: u8) -> Option<u8> {
         Self::block_index(x, y, z).and_then(|index| nibble_at(self.block_data(), index))
+    }
+
+    /// Returns the legacy heightmap value at a local column coordinate.
+    #[must_use]
+    pub fn height_at(self, x: u8, z: u8) -> Option<u8> {
+        Self::column_index(x, z).and_then(|index| self.heightmap().get(index).copied())
+    }
+
+    /// Returns the structured legacy biome sample at a local column coordinate.
+    #[must_use]
+    pub fn biome_sample_at(self, x: u8, z: u8) -> Option<LegacyBiomeSample> {
+        let offset = Self::column_index(x, z)?.checked_mul(4)?;
+        let bytes = self.biomes().get(offset..offset + 4)?;
+        Some(LegacyBiomeSample {
+            biome_id: bytes[0],
+            red: bytes[1],
+            green: bytes[2],
+            blue: bytes[3],
+        })
+    }
+
+    /// Returns the legacy biome RGB at a local column coordinate as
+    /// `0x00RRGGBB`.
+    #[must_use]
+    pub fn biome_color_at(self, x: u8, z: u8) -> Option<u32> {
+        self.biome_sample_at(x, z).map(LegacyBiomeSample::rgb_u32)
     }
 }
 
@@ -496,7 +582,7 @@ impl<'a> LegacySubChunk<'a> {
     #[must_use]
     pub const fn block_index(x: u8, y: u8, z: u8) -> Option<usize> {
         if x < 16 && y < 16 && z < 16 {
-            Some((y as usize * 16 + z as usize) * 16 + x as usize)
+            Some(x as usize * 256 + z as usize * 16 + y as usize)
         } else {
             None
         }
@@ -512,6 +598,18 @@ impl<'a> LegacySubChunk<'a> {
     #[must_use]
     pub fn block_data_at(self, x: u8, y: u8, z: u8) -> Option<u8> {
         Self::block_index(x, y, z).and_then(|index| nibble_at(self.block_data, index))
+    }
+
+    /// Returns the legacy sky-light nibble at a local subchunk coordinate.
+    #[must_use]
+    pub fn sky_light_at(self, x: u8, y: u8, z: u8) -> Option<u8> {
+        Self::block_index(x, y, z).and_then(|index| nibble_at(self.sky_light?, index))
+    }
+
+    /// Returns the legacy block-light nibble at a local subchunk coordinate.
+    #[must_use]
+    pub fn block_light_at(self, x: u8, y: u8, z: u8) -> Option<u8> {
+        Self::block_index(x, y, z).and_then(|index| nibble_at(self.block_light?, index))
     }
 }
 
@@ -552,6 +650,22 @@ mod tests {
     }
 
     #[test]
+    fn render_chunk_record_tags_are_recognized() {
+        for (byte, tag) in [
+            (0x2b, ChunkRecordTag::Data3D),
+            (0x2d, ChunkRecordTag::Data2D),
+            (0x2e, ChunkRecordTag::Data2DLegacy),
+            (0x2f, ChunkRecordTag::SubChunkPrefix),
+            (0x30, ChunkRecordTag::LegacyTerrain),
+        ] {
+            assert_eq!(ChunkRecordTag::from_byte(byte), tag);
+            assert_eq!(tag.as_byte(), byte);
+            assert!(tag.is_render_chunk_record());
+        }
+        assert!(!ChunkRecordTag::Unknown(0x31).is_render_chunk_record());
+    }
+
+    #[test]
     fn malformed_chunk_keys_are_not_classified_as_chunk_keys() {
         let mut missing_subchunk = Vec::new();
         missing_subchunk.extend_from_slice(&1_i32.to_le_bytes());
@@ -568,12 +682,30 @@ mod tests {
     fn legacy_terrain_exposes_documented_slices_and_nibbles() {
         let mut bytes = vec![0; LEGACY_TERRAIN_VALUE_LEN];
         let index = LegacyTerrain::block_index(1, 2, 3).expect("index");
+        let column = LegacyTerrain::column_index(1, 3).expect("column");
+        assert_eq!(index, 2_434);
+        assert_eq!(column, 19);
         bytes[index] = 42;
         bytes[LEGACY_TERRAIN_BLOCK_DATA_OFFSET + index / 2] = 0xba;
+        bytes[LEGACY_TERRAIN_HEIGHTMAP_OFFSET + column] = 99;
+        bytes[LEGACY_TERRAIN_BIOME_OFFSET + column * 4
+            ..LEGACY_TERRAIN_BIOME_OFFSET + column * 4 + 4]
+            .copy_from_slice(&[12, 0xab, 0xcd, 0xef]);
 
         let terrain = LegacyTerrain::parse(&bytes).expect("legacy terrain");
         assert_eq!(terrain.block_id(1, 2, 3), Some(42));
-        assert_eq!(terrain.block_data_at(1, 2, 3), Some(0x0b));
+        assert_eq!(terrain.block_data_at(1, 2, 3), Some(0x0a));
+        assert_eq!(terrain.height_at(1, 3), Some(99));
+        assert_eq!(terrain.biome_color_at(1, 3), Some(0x00ab_cdef));
+        assert_eq!(
+            terrain.biome_sample_at(1, 3),
+            Some(LegacyBiomeSample {
+                biome_id: 12,
+                red: 0xab,
+                green: 0xcd,
+                blue: 0xef,
+            })
+        );
         assert_eq!(terrain.heightmap().len(), 256);
         assert_eq!(terrain.biomes().len(), 1024);
         assert!(LegacyTerrain::parse(&bytes[..10]).is_err());
@@ -584,8 +716,11 @@ mod tests {
         let mut legacy = vec![0; LEGACY_SUBCHUNK_WITH_LIGHT_VALUE_LEN];
         legacy[0] = 2;
         let index = LegacySubChunk::block_index(4, 5, 6).expect("index");
+        assert_eq!(index, 1_125);
         legacy[1 + index] = 7;
-        legacy[1 + SUBCHUNK_BLOCK_COUNT + index / 2] = 0x0c;
+        legacy[1 + SUBCHUNK_BLOCK_COUNT + index / 2] = 0xc0;
+        legacy[1 + SUBCHUNK_BLOCK_COUNT + SUBCHUNK_BLOCK_COUNT / 2 + index / 2] = 0xe0;
+        legacy[1 + SUBCHUNK_BLOCK_COUNT + SUBCHUNK_BLOCK_COUNT + index / 2] = 0xa0;
 
         let SubChunkPayload::Legacy(subchunk) =
             SubChunkPayload::parse(&legacy).expect("legacy subchunk")
@@ -595,6 +730,8 @@ mod tests {
         assert_eq!(subchunk.version(), 2);
         assert_eq!(subchunk.block_id(4, 5, 6), Some(7));
         assert_eq!(subchunk.block_data_at(4, 5, 6), Some(0x0c));
+        assert_eq!(subchunk.sky_light_at(4, 5, 6), Some(0x0e));
+        assert_eq!(subchunk.block_light_at(4, 5, 6), Some(0x0a));
         assert!(subchunk.sky_light().is_some());
         assert!(subchunk.block_light().is_some());
 
