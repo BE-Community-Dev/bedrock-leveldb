@@ -1245,12 +1245,14 @@ fn get_native_table_entries_seeked(
             if !seen_user_keys.insert(user_key.to_vec()) {
                 continue;
             }
-            if is_value && let Some(indexes) = requested.remove(user_key) {
-                for index in indexes {
-                    results[index] = Some(value.clone());
-                }
-                if requested.is_empty() {
-                    return Ok(results);
+            if is_value {
+                if let Some(indexes) = requested.remove(user_key) {
+                    for index in indexes {
+                        results[index] = Some(value.clone());
+                    }
+                    if requested.is_empty() {
+                        return Ok(results);
+                    }
                 }
             }
         }

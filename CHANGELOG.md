@@ -2,6 +2,14 @@
 
 All notable changes to `bedrock-leveldb` are tracked here.
 
+## 0.2.1 - 2026-05-07
+
+### Fixed
+
+- Replaced an unstable `if` let-chain in native table multi-get code with
+  stable Rust syntax, preserving compatibility with the crate's declared
+  minimum supported Rust version.
+
 ## 0.2.0 - 2026-05-07
 
 ### Added
