@@ -59,6 +59,8 @@ its MSRV. Do not introduce APIs that require a newer compiler unless
 Default features are `zlib`, `snappy`, and `async`. Feature-specific code must
 compile in both default and `--no-default-features` builds. When adding optional
 behavior, prefer a feature that removes the dependency entirely when disabled.
+The `async` feature intentionally keeps Tokio default features disabled and
+enables only the runtime pieces used by `spawn_blocking` wrappers.
 
 This is a library crate. Do not initialize a global logger, and do not use
 `println!` or `eprintln!` in library code. Runtime diagnostics must go through
@@ -99,6 +101,8 @@ Important scenarios to preserve:
 - WAL replay handles fragmented records and tombstones.
 - Varint decoding rejects overflow and truncation.
 - Native flush/reopen preserves keys, values, sequence numbers, and deletions.
+- `OpenOptions::write_buffer_size = 0` keeps writes in the WAL overlay until an
+  explicit flush or other native recovery/compaction path consumes them.
 - Native table point reads and prefix scans honor manifest ranges and deletion
   records.
 - `ReadStrategy::Borrowed` callback scans return `ValueRef::Borrowed` for

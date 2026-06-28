@@ -9,6 +9,7 @@ use crate::table;
 use crate::wal;
 use bytes::Bytes;
 use rayon::ThreadPoolBuilder;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -520,8 +521,11 @@ impl Db {
         self.write(batch, options)
     }
 
-    /// Appends a batch to the native `LevelDB` WAL overlay and flushes when the
-    /// write buffer fills.
+    /// Appends a batch to the native `LevelDB` WAL overlay.
+    ///
+    /// The method flushes to a native table when the write buffer reaches
+    /// [`OpenOptions::write_buffer_size`]. Set that option to `0` to disable
+    /// automatic flushes and keep writes WAL-backed until an explicit flush.
     ///
     /// # Errors
     ///
@@ -554,7 +558,9 @@ impl Db {
             apply_batch(Arc::make_mut(&mut inner.overlay), &batch, approximate_bytes);
         inner.last_sequence = last_sequence;
 
-        if inner.approximate_bytes >= self.options.write_buffer_size {
+        if self.options.write_buffer_size != 0
+            && inner.approximate_bytes >= self.options.write_buffer_size
+        {
             self.flush_locked(&mut inner)?;
         }
         Ok(())
@@ -564,7 +570,8 @@ impl Db {
     ///
     /// This is the explicit v0.2 name for [`Db::write`]. It writes a standard
     /// `LevelDB` WAL batch and any automatic flush writes native `.ldb` tables
-    /// plus a native manifest version edit.
+    /// plus a native manifest version edit. Automatic flushes are skipped when
+    /// [`OpenOptions::write_buffer_size`] is `0`.
     ///
     /// # Errors
     ///
@@ -2264,13 +2271,11 @@ fn partition_paths_by_size(table_paths: Vec<PathBuf>, worker_count: usize) -> Ve
     let mut paths = table_paths
         .into_iter()
         .map(|path| {
-            let size = std::fs::metadata(&path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
+            let size = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
             (path, size)
         })
         .collect::<Vec<_>>();
-    paths.sort_by(|left, right| right.1.cmp(&left.1));
+    paths.sort_by_key(|(_, size)| Reverse(*size));
     let mut worker_loads = vec![0_u64; worker_count];
     let mut worker_paths = vec![Vec::new(); worker_count];
     for (path, size) in paths {
@@ -2932,6 +2937,37 @@ mod tests {
         assert_eq!(
             db.get(b"player_1").expect("get"),
             Some(Bytes::from_static(b"one"))
+        );
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[test]
+    fn zero_write_buffer_keeps_writes_in_wal_until_explicit_flush() {
+        let path = temp_dir("wal-no-auto-flush");
+        let options = OpenOptions {
+            compression_policy: CompressionPolicy::None,
+            write_buffer_size: 0,
+            ..OpenOptions::default()
+        };
+        {
+            let db = Db::open(&path, options.clone()).expect("open");
+            let value = Bytes::from(vec![1_u8; 4096]);
+            for index in 0..8 {
+                db.put(
+                    Bytes::from(format!("chunk:{index}")),
+                    value.clone(),
+                    WriteOptions::default(),
+                )
+                .expect("put");
+            }
+            assert_eq!(db.stats_fast().expect("stats").tables, 0);
+        }
+
+        let db = Db::open(&path, options).expect("reopen");
+        assert_eq!(db.stats_fast().expect("stats").tables, 0);
+        assert_eq!(
+            db.get(b"chunk:7").expect("get"),
+            Some(Bytes::from(vec![1_u8; 4096]))
         );
         std::fs::remove_dir_all(path).expect("cleanup");
     }

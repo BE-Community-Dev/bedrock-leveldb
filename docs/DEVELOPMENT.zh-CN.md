@@ -52,7 +52,8 @@ MSRV。不要引入需要更新编译器的 API，除非同步更新 `rust-versi
 
 默认 feature 是 `zlib`、`snappy` 和 `async`。feature-gated 代码必须同时在默认
 构建和 `--no-default-features` 构建中通过。新增可选行为时，优先使用禁用后能完全
-移除依赖的 feature。
+移除依赖的 feature。`async` feature 会刻意关闭 Tokio 默认 feature，只启用
+`spawn_blocking` wrapper 所需的 runtime 部分。
 
 这是库 crate。不要初始化全局 logger，也不要在库代码里使用 `println!` 或
 `eprintln!`。运行期诊断必须通过 `log` facade 发出，并保持低噪声。避免记录 raw
@@ -88,6 +89,8 @@ database open/read/write/recovery 行为放集成测试。
 - WAL replay 能处理 fragmented record 和 tombstone。
 - varint 解码拒绝 overflow 和 truncation。
 - native flush/reopen 保留 key、value、sequence number 和 deletion。
+- `OpenOptions::write_buffer_size = 0` 会让写入保留在 WAL overlay 中，直到
+  显式 flush 或其他原生 recovery/compaction 路径消费这些写入。
 - native table point read 与 prefix scan 尊重 manifest range 和 deletion record。
 - 顺序 scan 与 table-parallel scan 看到的 entry 一致。
 - 压缩 feature 禁用时返回类型化 unsupported/compression 错误。

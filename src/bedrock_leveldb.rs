@@ -4,7 +4,9 @@
 //! files and exposes lazy point lookups plus visitor-based scans over raw byte
 //! keys and values. The write path appends standard `LevelDB` write batches to
 //! WAL files and flushes native `.ldb` tables plus native manifest edits, while
-//! older crate-specific `BWLDB...` files remain readable for migration.
+//! older crate-specific `BWLDB...` files remain readable for migration. Set
+//! [`OpenOptions::write_buffer_size`] to `0` to keep writes in the WAL overlay
+//! until an explicit flush or compaction.
 //!
 //! # Logging
 //!
@@ -30,8 +32,10 @@
 //! # Features
 //!
 //! docs.rs builds this crate with all features enabled. Default builds enable
-//! `zlib`, `snappy`, and `async`. Optional `mmap` exposes read-only mapped
-//! table scans, while `repair-tools` and `bench` are reserved for tooling and
+//! `zlib`, `snappy`, and `async`. The `async` feature depends on Tokio with
+//! default features disabled and enables only the runtime pieces needed for
+//! `spawn_blocking` wrappers. Optional `mmap` exposes read-only mapped table
+//! scans, while `repair-tools` and `bench` are reserved for tooling and
 //! benchmark-only paths.
 //!
 //! # Example

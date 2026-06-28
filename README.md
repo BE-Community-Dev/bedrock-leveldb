@@ -115,6 +115,9 @@ repair, flush, or write to the database directory.
   `Db::compact_range_native`, and `Db::recover_native` are the explicit v0.2
   native write/recovery entry points. `Db::write`, `Db::flush`,
   `Db::compact_range`, and `Db::repair` delegate to the same native paths.
+- `OpenOptions::write_buffer_size` controls automatic native table flushes.
+  The default is 4 MiB. Set it to `0` to keep writes in the WAL overlay until
+  `Db::flush`, compaction, or recovery explicitly consumes them.
 - `ReadOptions::cache_policy` defaults to `Bypass`, so normal reads do not
   contend on the shared block cache. Set it to `Use` only when cross-request
   block reuse is worth the lock cost.
@@ -262,7 +265,7 @@ return `ErrorKind::ReadOnly` for writes, flushes, repair, and compaction.
 | --- | --- | --- |
 | `zlib` | yes | Enables zlib and Bedrock raw-deflate decompression/compression |
 | `snappy` | yes | Enables Snappy table decompression/compression |
-| `async` | yes | Adds `Db::open_async` through Tokio `spawn_blocking` |
+| `async` | yes | Adds Tokio `spawn_blocking` async wrappers; Tokio default features stay disabled |
 | `mmap` | no | Reserved for a future mapped read path |
 | `repair-tools` | no | Reserved for expanded repair tooling |
 | `bench` | no | Reserved for benchmark-only code paths |

@@ -98,6 +98,9 @@ fn main() -> bedrock_leveldb::Result<()> {
   `Db::compact_range_native` 和 `Db::recover_native` 是 v0.2 显式原生
   写入/恢复入口。`Db::write`、`Db::flush`、`Db::compact_range` 和
   `Db::repair` 委托到同一套原生路径。
+- `OpenOptions::write_buffer_size` 控制自动原生 table flush。默认值为 4 MiB；
+  设置为 `0` 时会关闭自动 flush，使写入保留在 WAL overlay 中，直到
+  `Db::flush`、compaction 或 recovery 显式消费这些写入。
 - `ReadOptions::pipeline` 控制本地 Rayon scan 调度。`queue_depth`、
   `table_batch_size` 和 `progress_interval` 为 0 时自动选择。`ScanOutcome`
   会报告 `tables_scanned`、`worker_threads`、`queue_wait_ms` 和 `cancel_checks`，
@@ -237,7 +240,7 @@ assert!(error.path().is_some());
 | --- | --- | --- |
 | `zlib` | 是 | 启用 zlib、Bedrock raw-deflate 解压和压缩 |
 | `snappy` | 是 | 启用 Snappy table 解压和压缩 |
-| `async` | 是 | 通过 Tokio `spawn_blocking` 提供 `Db::open_async` |
+| `async` | 是 | 提供 Tokio `spawn_blocking` async wrapper；Tokio 默认 feature 保持关闭 |
 | `mmap` | 否 | 为未来 mapped read path 预留 |
 | `repair-tools` | 否 | 为更完整 repair 工具预留 |
 | `bench` | 否 | 为 benchmark-only 代码路径预留 |

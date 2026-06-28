@@ -2,6 +2,21 @@
 
 All notable changes to `bedrock-leveldb` are tracked here.
 
+## 0.2.2 - 2026-06-28
+
+### Changed
+
+- Disabled Tokio default features for the optional `async` feature. The crate
+  now enables only the Tokio runtime pieces it needs for `spawn_blocking`
+  wrappers.
+
+### Fixed
+
+- Made `OpenOptions::write_buffer_size = 0` disable automatic native table
+  flushes instead of flushing after every write. WAL-backed writes now remain in
+  the overlay until an explicit flush, compaction, or recovery path consumes
+  them.
+
 ## 0.2.1 - 2026-05-07
 
 ### Documentation

@@ -27,6 +27,9 @@ pub struct OpenOptions {
     /// Maximum decoded native table block cache size, in bytes.
     pub cache_size: usize,
     /// Approximate overlay size that triggers a flush to a native table.
+    ///
+    /// Use `0` to disable automatic flushes and keep writes in the WAL overlay
+    /// until [`crate::Db::flush`] or another explicit native write path runs.
     pub write_buffer_size: usize,
 }
 
@@ -375,8 +378,7 @@ impl ThreadingOptions {
             Self::Single => 1,
             Self::Fixed(threads) => threads.clamp(1, MAX_LEVELDB_THREADS),
             Self::Auto => std::thread::available_parallelism()
-                .map(usize::from)
-                .unwrap_or(1)
+                .map_or(1, usize::from)
                 .min(work_items.max(1)),
         }
     }
@@ -407,8 +409,7 @@ mod tests {
     #[test]
     fn threading_validates_fixed_range_and_auto_is_not_capped_to_eight() {
         let expected_auto = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
+            .map_or(1, usize::from)
             .min(10_000);
         assert_eq!(
             ThreadingOptions::Auto
