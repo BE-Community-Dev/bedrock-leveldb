@@ -1,8 +1,8 @@
 #![allow(clippy::too_many_lines)]
 
 use bedrock_leveldb::{
-    CompressionPolicy, Db, OpenOptions, ReadOptions, ReadStrategy, ScanMode, VisitorControl,
-    WriteBatch, WriteOptions,
+    CachePolicy, CompressionPolicy, Db, OpenOptions, ReadOptions, ReadStrategy, ScanMode,
+    VisitorControl, WriteBatch, WriteOptions,
 };
 use bytes::Bytes;
 use criterion::{
@@ -124,6 +124,63 @@ fn bench_point_get(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_get_many(c: &mut Criterion) {
+    let entries = 4_096;
+    let (native_dir, native_db) = seed_native_db(entries, 256, 1);
+    let dense_keys = (1_920..2_176)
+        .map(|index| Bytes::from(format!("chunk:{index:06}")))
+        .collect::<Vec<_>>();
+    let sparse_keys = (1_920..2_176)
+        .flat_map(|index| {
+            [
+                Bytes::from(format!("chunk:{index:06}-missing")),
+                Bytes::from(format!("chunk:{index:06}")),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    let mut group = c.benchmark_group("bedrock_leveldb/get_many");
+    for (name, keys, cache_policy) in [
+        (
+            "native_table_256_dense_bypass",
+            &dense_keys,
+            CachePolicy::Bypass,
+        ),
+        ("native_table_256_dense_use", &dense_keys, CachePolicy::Use),
+        (
+            "native_table_512_sparse_bypass",
+            &sparse_keys,
+            CachePolicy::Bypass,
+        ),
+        (
+            "native_table_512_sparse_use",
+            &sparse_keys,
+            CachePolicy::Use,
+        ),
+    ] {
+        group.throughput(Throughput::Elements(
+            u64::try_from(keys.len()).expect("key count"),
+        ));
+        group.bench_with_input(BenchmarkId::from_parameter(name), keys, |b, keys| {
+            b.iter(|| {
+                black_box(
+                    native_db
+                        .get_many_owned(
+                            black_box(keys.clone()),
+                            ReadOptions {
+                                cache_policy,
+                                ..ReadOptions::default()
+                            },
+                        )
+                        .expect("get many"),
+                );
+            });
+        });
+    }
+    drop(native_dir);
+    group.finish();
+}
+
 fn bench_scans(c: &mut Criterion) {
     let entries = 4_096;
     let (_custom_dir, custom_db) = seed_flushed_custom_db(entries, 256);
@@ -137,6 +194,11 @@ fn bench_scans(c: &mut Criterion) {
         ("custom_for_each_key", &custom_db, ReadOptions::default()),
         ("custom_for_each_entry", &custom_db, ReadOptions::default()),
         ("native_for_each_prefix", &native_db, ReadOptions::default()),
+        (
+            "native_for_each_prefix_key",
+            &native_db,
+            ReadOptions::default(),
+        ),
         (
             "native_parallel_tables",
             &native_db,
@@ -158,6 +220,12 @@ fn bench_scans(c: &mut Criterion) {
                             Ok(VisitorControl::Continue)
                         })
                         .expect("scan keys");
+                    } else if name.ends_with("prefix_key") {
+                        db.for_each_prefix_key(b"chunk:00", read_options.clone(), |key| {
+                            bytes = bytes.saturating_add(key.len());
+                            Ok(VisitorControl::Continue)
+                        })
+                        .expect("scan prefix keys");
                     } else if name.ends_with("prefix") {
                         db.for_each_prefix(b"chunk:00", read_options.clone(), |_key, value| {
                             bytes = bytes.saturating_add(value.len());
@@ -241,7 +309,7 @@ fn bench_recover(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config = criterion();
-    targets = bench_writes, bench_point_get, bench_scans, bench_recover
+    targets = bench_writes, bench_point_get, bench_get_many, bench_scans, bench_recover
 );
 criterion_main!(benches);
 

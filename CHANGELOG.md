@@ -2,6 +2,15 @@
 
 All notable changes to `bedrock-leveldb` are tracked here.
 
+## 0.3.0 - 2026-07-14
+
+### Changed
+
+- Split native SSTable payloads into bounded data blocks and added a bounded
+  native index cache, improving point reads and range scans on larger tables.
+- Hardened native table reads for concurrent access by avoiding shared seek
+  cursors on cached file handles.
+
 ## 0.2.2 - 2026-06-28
 
 ### Changed

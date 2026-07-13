@@ -10,13 +10,13 @@ use memmap2::Mmap;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "mmap")]
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const TABLE_MAGIC: &[u8; 9] = b"BWLDBTBL1";
 const TABLE_VERSION: u32 = 1;
+const CUSTOM_TABLE_HEADER_LEN: usize = TABLE_MAGIC.len() + 9;
 
 const COMPRESSION_NONE: u8 = 0;
 const COMPRESSION_SNAPPY: u8 = 1;
@@ -25,6 +25,7 @@ const COMPRESSION_BEDROCK_ZLIB: u8 = 4;
 const LEVELDB_TABLE_MAGIC: u64 = 0xdb47_7524_8b80_fb57;
 const LEVELDB_FOOTER_LEN: usize = 48;
 const LEVELDB_BLOCK_TRAILER_LEN: usize = 5;
+const NATIVE_DATA_BLOCK_TARGET: usize = 4 * 1024;
 
 enum TableBuffer {
     Heap(Bytes),
@@ -63,10 +64,18 @@ impl BlockValue<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CustomTablePayload<'a> {
+    compression_tag: u8,
+    encoded: &'a [u8],
+}
+
 #[derive(Debug)]
 pub(crate) struct NativeBlockCache {
     capacity: usize,
+    index_capacity: usize,
     inner: Mutex<NativeBlockCacheInner>,
+    indexes: Mutex<NativeIndexCacheInner>,
 }
 
 #[derive(Debug, Default)]
@@ -74,6 +83,13 @@ struct NativeBlockCacheInner {
     bytes: usize,
     entries: HashMap<NativeBlockCacheKey, Bytes>,
     order: VecDeque<NativeBlockCacheKey>,
+}
+
+#[derive(Debug, Default)]
+struct NativeIndexCacheInner {
+    bytes: usize,
+    entries: HashMap<NativeIndexCacheKey, NativeIndexEntries>,
+    order: VecDeque<NativeIndexCacheKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -84,11 +100,27 @@ struct NativeBlockCacheKey {
     paranoid_checks: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NativeIndexCacheKey {
+    path: PathBuf,
+    paranoid_checks: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NativeIndexEntry {
+    key: Bytes,
+    value: Bytes,
+}
+
+type NativeIndexEntries = Arc<[NativeIndexEntry]>;
+
 impl NativeBlockCache {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             capacity,
+            index_capacity: capacity / 4,
             inner: Mutex::new(NativeBlockCacheInner::default()),
+            indexes: Mutex::new(NativeIndexCacheInner::default()),
         }
     }
 
@@ -125,6 +157,51 @@ impl NativeBlockCache {
                 inner.bytes = inner.bytes.saturating_sub(old_block.len());
             }
         }
+    }
+
+    fn get_index(&self, key: &NativeIndexCacheKey) -> Option<NativeIndexEntries> {
+        if self.index_capacity == 0 {
+            return None;
+        }
+        self.indexes
+            .lock()
+            .ok()
+            .and_then(|inner| inner.entries.get(key).cloned())
+    }
+
+    fn insert_index(&self, key: NativeIndexCacheKey, entries: NativeIndexEntries) {
+        let entries_len = native_index_entries_size(&entries);
+        if self.index_capacity == 0 || entries_len > self.index_capacity {
+            return;
+        }
+        let Ok(mut inner) = self.indexes.lock() else {
+            return;
+        };
+        if let Some(old_entries) = inner.entries.remove(&key) {
+            inner.bytes = inner
+                .bytes
+                .saturating_sub(native_index_entries_size(&old_entries));
+            inner.order.retain(|old_key| old_key != &key);
+        }
+        inner.order.push_back(key.clone());
+        inner.entries.insert(key, entries);
+        inner.bytes = inner.bytes.saturating_add(entries_len);
+        while inner.bytes > self.index_capacity {
+            let Some(old_key) = inner.order.pop_front() else {
+                break;
+            };
+            if let Some(old_entries) = inner.entries.remove(&old_key) {
+                inner.bytes = inner
+                    .bytes
+                    .saturating_sub(native_index_entries_size(&old_entries));
+            }
+        }
+    }
+
+    fn open_table_file(&self, path: &Path) -> Result<File> {
+        // `File::try_clone` duplicates an OS handle but shares its seek cursor. Table reads
+        // seek before every block, so cached clones corrupt concurrent reads.
+        open_table_file_uncached(path)
     }
 }
 
@@ -191,57 +268,31 @@ pub(crate) fn write_native_table(
         ));
     }
 
-    let internal_entries = entries
-        .iter()
-        .map(|(key, value)| {
-            (
-                internal_key(key, sequence, crate::coding::VALUE_TYPE_VALUE),
-                value.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let smallest_internal_key = internal_entries
-        .first()
-        .expect("entries is not empty")
-        .0
-        .clone();
-    let largest_internal_key = internal_entries
-        .last()
-        .expect("entries is not empty")
-        .0
-        .clone();
-
-    let data_block = encode_native_block(&internal_entries)?;
-    let encoded_data_block = compress_payload(compression, &data_block)?;
+    let smallest_internal_key = internal_key(
+        entries.first_key_value().expect("entries is not empty").0,
+        sequence,
+        crate::coding::VALUE_TYPE_VALUE,
+    );
+    let largest_internal_key = internal_key(
+        entries.last_key_value().expect("entries is not empty").0,
+        sequence,
+        crate::coding::VALUE_TYPE_VALUE,
+    );
+    let blocks = native_data_blocks(entries, sequence);
     let data_compression = compression_tag(compression);
+    let mut table = Vec::new();
+    let mut index_entries = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let largest_key = block.last().expect("native block is not empty").0.clone();
+        let handle = append_native_data_block(&mut table, &block, compression, data_compression)?;
+        let mut handle_bytes = Vec::new();
+        write_block_handle(handle, &mut handle_bytes);
+        index_entries.push((largest_key, Bytes::from(handle_bytes)));
+    }
 
-    let mut data_handle = Vec::new();
-    put_varint64(0, &mut data_handle);
-    put_varint64(
-        u64::try_from(encoded_data_block.len()).map_err(|_| {
-            LevelDbError::invalid_argument("native data block is too large".to_string())
-        })?,
-        &mut data_handle,
-    );
-
-    let index_offset = u64::try_from(
-        encoded_data_block
-            .len()
-            .saturating_add(LEVELDB_BLOCK_TRAILER_LEN),
-    )
-    .map_err(|_| LevelDbError::invalid_argument("native index offset overflow".to_string()))?;
-    let index_block =
-        encode_native_block(&[(largest_internal_key.clone(), Bytes::from(data_handle))])?;
-
-    let mut table = Vec::with_capacity(
-        encoded_data_block
-            .len()
-            .saturating_add(index_block.len())
-            .saturating_add(LEVELDB_BLOCK_TRAILER_LEN * 2)
-            .saturating_add(LEVELDB_FOOTER_LEN),
-    );
-    table.extend_from_slice(&encoded_data_block);
-    push_native_block_trailer(&mut table, &encoded_data_block, data_compression);
+    let index_offset = u64::try_from(table.len())
+        .map_err(|_| LevelDbError::invalid_argument("native index offset overflow".to_string()))?;
+    let index_block = encode_native_block(&index_entries)?;
     table.extend_from_slice(&index_block);
     push_native_block_trailer(&mut table, &index_block, COMPRESSION_NONE);
     push_native_footer(
@@ -268,6 +319,50 @@ pub(crate) fn write_native_table(
     })
 }
 
+fn native_data_blocks(
+    entries: &BTreeMap<Vec<u8>, Bytes>,
+    sequence: u64,
+) -> Vec<Vec<(Vec<u8>, Bytes)>> {
+    let mut blocks = Vec::new();
+    let mut block = Vec::new();
+    let mut block_len = 4_usize;
+    for (key, value) in entries {
+        let internal_key = internal_key(key, sequence, crate::coding::VALUE_TYPE_VALUE);
+        let entry_len = native_block_entry_len(&internal_key, value);
+        if !block.is_empty() && block_len.saturating_add(entry_len) > NATIVE_DATA_BLOCK_TARGET {
+            blocks.push(block);
+            block = Vec::new();
+            block_len = 4;
+        }
+        block_len = block_len.saturating_add(entry_len);
+        block.push((internal_key, value.clone()));
+    }
+    if !block.is_empty() {
+        blocks.push(block);
+    }
+    blocks
+}
+
+fn append_native_data_block(
+    table: &mut Vec<u8>,
+    entries: &[(Vec<u8>, Bytes)],
+    compression: CompressionPolicy,
+    compression_tag: u8,
+) -> Result<BlockHandle> {
+    let encoded = compress_payload(compression, &encode_native_block(entries)?)?;
+    let handle = BlockHandle {
+        offset: u64::try_from(table.len()).map_err(|_| {
+            LevelDbError::invalid_argument("native data block offset overflow".to_string())
+        })?,
+        size: u64::try_from(encoded.len()).map_err(|_| {
+            LevelDbError::invalid_argument("native data block is too large".to_string())
+        })?,
+    };
+    table.extend_from_slice(&encoded);
+    push_native_block_trailer(table, &encoded, compression_tag);
+    Ok(handle)
+}
+
 pub(crate) fn read_table(path: &Path, paranoid_checks: bool) -> Result<BTreeMap<Vec<u8>, Bytes>> {
     log::trace!("reading table {}", path.display());
     read_table_impl(path, paranoid_checks).map_err(|error| with_table_path(error, path))
@@ -275,40 +370,14 @@ pub(crate) fn read_table(path: &Path, paranoid_checks: bool) -> Result<BTreeMap<
 
 fn read_table_impl(path: &Path, paranoid_checks: bool) -> Result<BTreeMap<Vec<u8>, Bytes>> {
     let bytes = fs::read(path).map_err(|error| LevelDbError::io_at("read table", path, error))?;
-    if bytes.len() < TABLE_MAGIC.len() + 9 {
+    if bytes.len() < CUSTOM_TABLE_HEADER_LEN {
         return read_native_table(path, &bytes, paranoid_checks);
     }
     if &bytes[..TABLE_MAGIC.len()] != TABLE_MAGIC {
         return read_native_table(path, &bytes, paranoid_checks);
     }
-    let version_offset = TABLE_MAGIC.len();
-    let version = u32::from_le_bytes(
-        bytes[version_offset..version_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table version is truncated".to_string()))?,
-    );
-    if version != TABLE_VERSION {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("unsupported table version {version}"),
-        ));
-    }
-    let compression_tag = bytes[version_offset + 4];
-    let crc_offset = version_offset + 5;
-    let expected_crc = u32::from_le_bytes(
-        bytes[crc_offset..crc_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table crc is truncated".to_string()))?,
-    );
-    let encoded = &bytes[crc_offset + 4..];
-    if paranoid_checks && crate::coding::crc32c(encoded) != expected_crc {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("table {} checksum mismatch", path.display()),
-        ));
-    }
-
-    let payload = decompress_payload(compression_tag, encoded)?;
+    let custom_payload = custom_table_payload(path, &bytes, paranoid_checks)?;
+    let payload = decompress_payload(custom_payload.compression_tag, custom_payload.encoded)?;
     decode_entries(&payload)
 }
 
@@ -322,6 +391,62 @@ fn with_table_path(error: LevelDbError, path: &Path) -> LevelDbError {
     }
 }
 
+fn custom_table_payload<'a>(
+    path: &Path,
+    bytes: &'a [u8],
+    paranoid_checks: bool,
+) -> Result<CustomTablePayload<'a>> {
+    if !bytes.starts_with(TABLE_MAGIC) {
+        return Err(LevelDbError::corruption_at(
+            path,
+            "custom table magic mismatch".to_string(),
+        ));
+    }
+
+    let version_offset = TABLE_MAGIC.len();
+    let version = u32::from_le_bytes(
+        bytes
+            .get(version_offset..version_offset + 4)
+            .ok_or_else(|| {
+                LevelDbError::corruption_at(path, "table version is truncated".to_string())
+            })?
+            .try_into()
+            .map_err(|_| LevelDbError::corruption_at(path, "table version is truncated"))?,
+    );
+    if version != TABLE_VERSION {
+        return Err(LevelDbError::corruption_at(
+            path,
+            format!("unsupported table version {version}"),
+        ));
+    }
+
+    let compression_tag = *bytes.get(version_offset + 4).ok_or_else(|| {
+        LevelDbError::corruption_at(path, "table compression tag is truncated".to_string())
+    })?;
+    let crc_offset = version_offset + 5;
+    let expected_crc = u32::from_le_bytes(
+        bytes
+            .get(crc_offset..crc_offset + 4)
+            .ok_or_else(|| LevelDbError::corruption_at(path, "table crc is truncated".to_string()))?
+            .try_into()
+            .map_err(|_| LevelDbError::corruption_at(path, "table crc is truncated"))?,
+    );
+    let encoded = bytes
+        .get(crc_offset + 4..)
+        .ok_or_else(|| LevelDbError::corruption_at(path, "table payload is truncated"))?;
+    if paranoid_checks && crate::coding::crc32c(encoded) != expected_crc {
+        return Err(LevelDbError::corruption_at(
+            path,
+            format!("table {} checksum mismatch", path.display()),
+        ));
+    }
+
+    Ok(CustomTablePayload {
+        compression_tag,
+        encoded,
+    })
+}
+
 pub(crate) fn for_each_table_entry<F>(
     path: &Path,
     paranoid_checks: bool,
@@ -331,39 +456,16 @@ pub(crate) fn for_each_table_entry<F>(
 where
     F: FnMut(&[u8], &Bytes) -> Result<VisitorControl>,
 {
-    let Some(bytes) = read_custom_table_bytes(path)? else {
+    let Some(bytes) = read_custom_table_bytes(path, cache)? else {
         log::trace!("scanning native table entries {}", path.display());
         return for_each_native_table_entry_seeked(path, paranoid_checks, cache, visitor);
     };
     log::trace!("scanning custom table entries {}", path.display());
-    let version_offset = TABLE_MAGIC.len();
-    let version = u32::from_le_bytes(
-        bytes[version_offset..version_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table version is truncated".to_string()))?,
-    );
-    if version != TABLE_VERSION {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("unsupported table version {version}"),
-        ));
-    }
-    let compression_tag = bytes[version_offset + 4];
-    let crc_offset = version_offset + 5;
-    let expected_crc = u32::from_le_bytes(
-        bytes[crc_offset..crc_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table crc is truncated".to_string()))?,
-    );
-    let encoded = &bytes[crc_offset + 4..];
-    if paranoid_checks && crate::coding::crc32c(encoded) != expected_crc {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("table {} checksum mismatch", path.display()),
-        ));
-    }
-
-    let payload = Bytes::from(decompress_payload(compression_tag, encoded)?);
+    let custom_payload = custom_table_payload(path, &bytes, paranoid_checks)?;
+    let payload = Bytes::from(decompress_payload(
+        custom_payload.compression_tag,
+        custom_payload.encoded,
+    )?);
     let mut input = payload.as_ref();
     let count = usize::try_from(get_varint32(&mut input)?)
         .map_err(|_| LevelDbError::corruption("entry count overflow".to_string()))?;
@@ -413,39 +515,16 @@ pub(crate) fn for_each_table_key<F>(
 where
     F: FnMut(&[u8]) -> Result<VisitorControl>,
 {
-    let Some(bytes) = read_custom_table_bytes(path)? else {
+    let Some(bytes) = read_custom_table_bytes(path, cache)? else {
         log::trace!("scanning native table keys {}", path.display());
         return for_each_native_table_key_seeked(path, paranoid_checks, cache, visitor);
     };
     log::trace!("scanning custom table keys {}", path.display());
-    let version_offset = TABLE_MAGIC.len();
-    let version = u32::from_le_bytes(
-        bytes[version_offset..version_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table version is truncated".to_string()))?,
-    );
-    if version != TABLE_VERSION {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("unsupported table version {version}"),
-        ));
-    }
-    let compression_tag = bytes[version_offset + 4];
-    let crc_offset = version_offset + 5;
-    let expected_crc = u32::from_le_bytes(
-        bytes[crc_offset..crc_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table crc is truncated".to_string()))?,
-    );
-    let encoded = &bytes[crc_offset + 4..];
-    if paranoid_checks && crate::coding::crc32c(encoded) != expected_crc {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("table {} checksum mismatch", path.display()),
-        ));
-    }
-
-    let payload = Bytes::from(decompress_payload(compression_tag, encoded)?);
+    let custom_payload = custom_table_payload(path, &bytes, paranoid_checks)?;
+    let payload = Bytes::from(decompress_payload(
+        custom_payload.compression_tag,
+        custom_payload.encoded,
+    )?);
     let mut input = payload.as_ref();
     let count = usize::try_from(get_varint32(&mut input)?)
         .map_err(|_| LevelDbError::corruption("entry count overflow".to_string()))?;
@@ -476,34 +555,11 @@ fn for_each_custom_table_entry_bytes<F>(
 where
     F: FnMut(&[u8], &Bytes) -> Result<VisitorControl>,
 {
-    let version_offset = TABLE_MAGIC.len();
-    let version = u32::from_le_bytes(
-        bytes[version_offset..version_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table version is truncated".to_string()))?,
-    );
-    if version != TABLE_VERSION {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("unsupported table version {version}"),
-        ));
-    }
-    let compression_tag = bytes[version_offset + 4];
-    let crc_offset = version_offset + 5;
-    let expected_crc = u32::from_le_bytes(
-        bytes[crc_offset..crc_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table crc is truncated".to_string()))?,
-    );
-    let encoded = &bytes[crc_offset + 4..];
-    if paranoid_checks && crate::coding::crc32c(encoded) != expected_crc {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("table {} checksum mismatch", path.display()),
-        ));
-    }
-
-    let payload = Bytes::from(decompress_payload(compression_tag, encoded)?);
+    let custom_payload = custom_table_payload(path, bytes, paranoid_checks)?;
+    let payload = Bytes::from(decompress_payload(
+        custom_payload.compression_tag,
+        custom_payload.encoded,
+    )?);
     let mut input = payload.as_ref();
     let count = usize::try_from(get_varint32(&mut input)?)
         .map_err(|_| LevelDbError::corruption("entry count overflow".to_string()))?;
@@ -535,37 +591,14 @@ fn for_each_custom_table_entry_ref_bytes<F>(
 where
     F: FnMut(&[u8], ValueRef<'_>) -> Result<VisitorControl>,
 {
-    let version_offset = TABLE_MAGIC.len();
-    let version = u32::from_le_bytes(
-        bytes[version_offset..version_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table version is truncated".to_string()))?,
-    );
-    if version != TABLE_VERSION {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("unsupported table version {version}"),
-        ));
-    }
-    let compression_tag = bytes[version_offset + 4];
-    let crc_offset = version_offset + 5;
-    let expected_crc = u32::from_le_bytes(
-        bytes[crc_offset..crc_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table crc is truncated".to_string()))?,
-    );
-    let encoded = &bytes[crc_offset + 4..];
-    if paranoid_checks && crate::coding::crc32c(encoded) != expected_crc {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("table {} checksum mismatch", path.display()),
-        ));
-    }
-
-    let payload = if compression_tag == COMPRESSION_NONE {
-        BlockValue::Borrowed(encoded)
+    let custom_payload = custom_table_payload(path, bytes, paranoid_checks)?;
+    let payload = if custom_payload.compression_tag == COMPRESSION_NONE {
+        BlockValue::Borrowed(custom_payload.encoded)
     } else {
-        BlockValue::Shared(Bytes::from(decompress_payload(compression_tag, encoded)?))
+        BlockValue::Shared(Bytes::from(decompress_payload(
+            custom_payload.compression_tag,
+            custom_payload.encoded,
+        )?))
     };
     let mut input = payload.as_bytes();
     let count = usize::try_from(get_varint32(&mut input)?)
@@ -602,7 +635,7 @@ where
     if prefix.is_empty() {
         return for_each_table_entry(path, paranoid_checks, cache, visitor);
     }
-    let Some(bytes) = read_custom_table_bytes(path)? else {
+    let Some(bytes) = read_custom_table_bytes(path, cache)? else {
         log::trace!(
             "scanning native table prefix of {} bytes in {}",
             prefix.len(),
@@ -668,7 +701,7 @@ where
     if prefix.is_empty() {
         return for_each_table_key(path, paranoid_checks, cache, visitor);
     }
-    let Some(bytes) = read_custom_table_bytes(path)? else {
+    let Some(bytes) = read_custom_table_bytes(path, cache)? else {
         log::trace!(
             "scanning native table prefix keys of {} bytes in {}",
             prefix.len(),
@@ -702,7 +735,7 @@ fn get_table_entry_impl(
     paranoid_checks: bool,
     cache: Option<&NativeBlockCache>,
 ) -> Result<Option<Bytes>> {
-    let Some(bytes) = read_custom_table_bytes(path)? else {
+    let Some(bytes) = read_custom_table_bytes(path, cache)? else {
         return get_native_table_entry_seeked(path, key, paranoid_checks, cache);
     };
 
@@ -736,7 +769,7 @@ fn get_table_entries_impl(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let Some(bytes) = read_custom_table_bytes(path)? else {
+    let Some(bytes) = read_custom_table_bytes(path, cache)? else {
         return get_native_table_entries_seeked(path, keys, paranoid_checks, cache);
     };
 
@@ -803,34 +836,11 @@ fn for_each_custom_table_prefix_key_bytes<F>(
 where
     F: FnMut(&[u8]) -> Result<VisitorControl>,
 {
-    let version_offset = TABLE_MAGIC.len();
-    let version = u32::from_le_bytes(
-        bytes[version_offset..version_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table version is truncated".to_string()))?,
-    );
-    if version != TABLE_VERSION {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("unsupported table version {version}"),
-        ));
-    }
-    let compression_tag = bytes[version_offset + 4];
-    let crc_offset = version_offset + 5;
-    let expected_crc = u32::from_le_bytes(
-        bytes[crc_offset..crc_offset + 4]
-            .try_into()
-            .map_err(|_| LevelDbError::corruption("table crc is truncated".to_string()))?,
-    );
-    let encoded = &bytes[crc_offset + 4..];
-    if paranoid_checks && crate::coding::crc32c(encoded) != expected_crc {
-        return Err(LevelDbError::corruption_at(
-            path,
-            format!("table {} checksum mismatch", path.display()),
-        ));
-    }
-
-    let payload = Bytes::from(decompress_payload(compression_tag, encoded)?);
+    let custom_payload = custom_table_payload(path, bytes, paranoid_checks)?;
+    let payload = Bytes::from(decompress_payload(
+        custom_payload.compression_tag,
+        custom_payload.encoded,
+    )?);
     let mut input = payload.as_ref();
     let count = usize::try_from(get_varint32(&mut input)?)
         .map_err(|_| LevelDbError::corruption("entry count overflow".to_string()))?;
@@ -860,9 +870,11 @@ struct BlockHandle {
     size: u64,
 }
 
-fn read_custom_table_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
-    let mut file =
-        File::open(path).map_err(|error| LevelDbError::io_at("open table", path, error))?;
+fn read_custom_table_bytes(
+    path: &Path,
+    cache: Option<&NativeBlockCache>,
+) -> Result<Option<Vec<u8>>> {
+    let mut file = open_table_file(path, cache)?;
     let mut header = [0_u8; TABLE_MAGIC.len()];
     let bytes_read = file
         .read(&mut header)
@@ -875,6 +887,25 @@ fn read_custom_table_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     file.read_to_end(&mut bytes)
         .map_err(|error| LevelDbError::io_at("read table body", path, error))?;
     Ok(Some(bytes))
+}
+
+fn open_table_file(path: &Path, cache: Option<&NativeBlockCache>) -> Result<File> {
+    if let Some(cache) = cache {
+        cache.open_table_file(path)
+    } else {
+        open_table_file_uncached(path)
+    }
+}
+
+fn open_table_file_uncached(path: &Path) -> Result<File> {
+    File::open(path).map_err(|error| LevelDbError::io_at("open native table", path, error))
+}
+
+fn native_index_entries_size(entries: &[NativeIndexEntry]) -> usize {
+    entries
+        .iter()
+        .map(|entry| entry.key.len().saturating_add(entry.value.len()))
+        .sum()
 }
 
 fn read_table_buffer(path: &Path) -> Result<TableBuffer> {
@@ -911,7 +942,7 @@ fn read_table_buffer_mmap(path: &Path) -> Result<TableBuffer> {
 }
 
 fn is_custom_table_bytes(bytes: &[u8]) -> bool {
-    bytes.len() >= TABLE_MAGIC.len() + 9 && &bytes[..TABLE_MAGIC.len()] == TABLE_MAGIC
+    bytes.len() >= CUSTOM_TABLE_HEADER_LEN && &bytes[..TABLE_MAGIC.len()] == TABLE_MAGIC
 }
 
 fn for_each_native_table_entry_seeked<F>(
@@ -923,13 +954,12 @@ fn for_each_native_table_entry_seeked<F>(
 where
     F: FnMut(&[u8], &Bytes) -> Result<VisitorControl>,
 {
-    let mut file =
-        File::open(path).map_err(|error| LevelDbError::io_at("open native table", path, error))?;
+    let mut file = open_table_file(path, cache)?;
     let index_entries = read_native_index_entries(&mut file, path, paranoid_checks, cache)?;
     let mut outcome = ScanOutcome::empty();
     let mut seen_user_keys = BTreeSet::new();
-    for (_, handle_bytes) in index_entries {
-        let mut handle_input = handle_bytes.as_ref();
+    for entry in index_entries.iter() {
+        let mut handle_input = entry.value.as_ref();
         let data_handle = read_block_handle(&mut handle_input)?;
         let data_block =
             read_native_block_from_file(&mut file, path, data_handle, paranoid_checks, cache)?;
@@ -961,30 +991,34 @@ fn for_each_native_table_key_seeked<F>(
 where
     F: FnMut(&[u8]) -> Result<VisitorControl>,
 {
-    let mut file =
-        File::open(path).map_err(|error| LevelDbError::io_at("open native table", path, error))?;
+    let mut file = open_table_file(path, cache)?;
     let index_entries = read_native_index_entries(&mut file, path, paranoid_checks, cache)?;
     let mut outcome = ScanOutcome::empty();
-    let mut seen_user_keys = BTreeSet::new();
-    for (_, handle_bytes) in index_entries {
-        let mut handle_input = handle_bytes.as_ref();
+    let mut previous_user_key = Vec::new();
+    for entry in index_entries.iter() {
+        let mut handle_input = entry.value.as_ref();
         let data_handle = read_block_handle(&mut handle_input)?;
         let data_block =
             read_native_block_from_file(&mut file, path, data_handle, paranoid_checks, cache)?;
-        for (internal_key, value_len) in decode_native_block_keys_bytes(&data_block)? {
-            let Some((user_key, is_value)) = split_internal_key(&internal_key) else {
-                continue;
-            };
-            if !seen_user_keys.insert(user_key.to_vec()) {
-                continue;
-            }
-            if is_value {
-                outcome.record(value_len);
-                if visitor(user_key)? == VisitorControl::Stop {
-                    outcome.stopped = true;
-                    return Ok(mark_table_scanned(outcome));
+        let stopped =
+            decode_native_block_entry_ranges(&data_block, |internal_key, value_range| {
+                let Some((user_key, is_value)) = split_internal_key(&internal_key) else {
+                    return Ok(VisitorControl::Continue);
+                };
+                if !is_next_user_key(&mut previous_user_key, user_key) {
+                    return Ok(VisitorControl::Continue);
                 }
-            }
+                if is_value {
+                    outcome.record(value_range.len());
+                    if visitor(user_key)? == VisitorControl::Stop {
+                        return Ok(VisitorControl::Stop);
+                    }
+                }
+                Ok(VisitorControl::Continue)
+            })?;
+        if stopped == VisitorControl::Stop {
+            outcome.stopped = true;
+            return Ok(mark_table_scanned(outcome));
         }
     }
     Ok(mark_table_scanned(outcome))
@@ -1000,19 +1034,18 @@ fn for_each_native_table_prefix_seeked<F>(
 where
     F: FnMut(&[u8], &Bytes) -> Result<VisitorControl>,
 {
-    let mut file =
-        File::open(path).map_err(|error| LevelDbError::io_at("open native table", path, error))?;
+    let mut file = open_table_file(path, cache)?;
     let index_entries = read_native_index_entries(&mut file, path, paranoid_checks, cache)?;
     let mut outcome = ScanOutcome::empty();
     let mut seen_user_keys = BTreeSet::new();
-    for (index_key, handle_bytes) in index_entries {
-        let Some((largest_key, _)) = split_internal_key(&index_key) else {
+    for entry in index_entries.iter() {
+        let Some((largest_key, _)) = split_internal_key(entry.key.as_ref()) else {
             continue;
         };
         if largest_key < prefix {
             continue;
         }
-        let mut handle_input = handle_bytes.as_ref();
+        let mut handle_input = entry.value.as_ref();
         let data_handle = read_block_handle(&mut handle_input)?;
         let data_block =
             read_native_block_from_file(&mut file, path, data_handle, paranoid_checks, cache)?;
@@ -1049,40 +1082,49 @@ fn for_each_native_table_prefix_key_seeked<F>(
 where
     F: FnMut(&[u8]) -> Result<VisitorControl>,
 {
-    let mut file =
-        File::open(path).map_err(|error| LevelDbError::io_at("open native table", path, error))?;
+    let mut file = open_table_file(path, cache)?;
     let index_entries = read_native_index_entries(&mut file, path, paranoid_checks, cache)?;
     let mut outcome = ScanOutcome::empty();
-    let mut seen_user_keys = BTreeSet::new();
-    for (index_key, handle_bytes) in index_entries {
-        let Some((largest_key, _)) = split_internal_key(&index_key) else {
+    let mut previous_user_key = Vec::new();
+    for entry in index_entries.iter() {
+        let Some((largest_key, _)) = split_internal_key(entry.key.as_ref()) else {
             continue;
         };
         if largest_key < prefix {
             continue;
         }
-        let mut handle_input = handle_bytes.as_ref();
+        let mut handle_input = entry.value.as_ref();
         let data_handle = read_block_handle(&mut handle_input)?;
         let data_block =
             read_native_block_from_file(&mut file, path, data_handle, paranoid_checks, cache)?;
-        for (internal_key, value_len) in decode_native_block_keys_bytes(&data_block)? {
-            let Some((user_key, is_value)) = split_internal_key(&internal_key) else {
-                continue;
-            };
-            if !seen_user_keys.insert(user_key.to_vec()) {
-                continue;
-            }
-            if user_key.starts_with(prefix) {
-                if is_value {
-                    outcome.record(value_len);
-                    if visitor(user_key)? == VisitorControl::Stop {
-                        outcome.stopped = true;
-                        return Ok(mark_table_scanned(outcome));
-                    }
+        let mut reached_prefix_end = false;
+        let stopped =
+            decode_native_block_entry_ranges(&data_block, |internal_key, value_range| {
+                let Some((user_key, is_value)) = split_internal_key(&internal_key) else {
+                    return Ok(VisitorControl::Continue);
+                };
+                if !is_next_user_key(&mut previous_user_key, user_key) {
+                    return Ok(VisitorControl::Continue);
                 }
-            } else if user_key > prefix {
+                if user_key.starts_with(prefix) {
+                    if is_value {
+                        outcome.record(value_range.len());
+                        if visitor(user_key)? == VisitorControl::Stop {
+                            return Ok(VisitorControl::Stop);
+                        }
+                    }
+                } else if user_key > prefix {
+                    reached_prefix_end = true;
+                    return Ok(VisitorControl::Stop);
+                }
+                Ok(VisitorControl::Continue)
+            })?;
+        if stopped == VisitorControl::Stop {
+            if reached_prefix_end {
                 return Ok(mark_table_scanned(outcome));
             }
+            outcome.stopped = true;
+            return Ok(mark_table_scanned(outcome));
         }
     }
     Ok(mark_table_scanned(outcome))
@@ -1179,31 +1221,36 @@ fn get_native_table_entry_seeked(
     paranoid_checks: bool,
     cache: Option<&NativeBlockCache>,
 ) -> Result<Option<Bytes>> {
-    let mut file =
-        File::open(path).map_err(|error| LevelDbError::io_at("open native table", path, error))?;
+    let mut file = open_table_file(path, cache)?;
     let index_entries = read_native_index_entries(&mut file, path, paranoid_checks, cache)?;
-    for (index_key, handle_bytes) in index_entries {
-        let Some((largest_key, _)) = split_internal_key(&index_key) else {
+    for entry in index_entries.iter() {
+        let Some((largest_key, _)) = split_internal_key(entry.key.as_ref()) else {
             continue;
         };
         if largest_key < key {
             continue;
         }
-        let mut handle_input = handle_bytes.as_ref();
+        let mut handle_input = entry.value.as_ref();
         let data_handle = read_block_handle(&mut handle_input)?;
         let data_block =
             read_native_block_from_file(&mut file, path, data_handle, paranoid_checks, cache)?;
-        for (internal_key, value) in decode_native_block_entries_bytes(&data_block)? {
-            let Some((user_key, is_value)) = split_internal_key(&internal_key) else {
-                continue;
+        let mut found = None;
+        decode_native_block_entry_ranges(data_block.as_ref(), |internal_key, value_range| {
+            let Some((user_key, is_value)) = split_internal_key(internal_key) else {
+                return Ok(VisitorControl::Continue);
             };
             match user_key.cmp(key) {
-                std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal if is_value => return Ok(Some(value)),
-                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => return Ok(None),
+                std::cmp::Ordering::Less => Ok(VisitorControl::Continue),
+                std::cmp::Ordering::Equal => {
+                    if is_value {
+                        found = Some(data_block.slice(value_range));
+                    }
+                    Ok(VisitorControl::Stop)
+                }
+                std::cmp::Ordering::Greater => Ok(VisitorControl::Stop),
             }
-        }
-        return Ok(None);
+        })?;
+        return Ok(found);
     }
     Ok(None)
 }
@@ -1214,18 +1261,16 @@ fn get_native_table_entries_seeked(
     paranoid_checks: bool,
     cache: Option<&NativeBlockCache>,
 ) -> Result<Vec<Option<Bytes>>> {
-    let mut file =
-        File::open(path).map_err(|error| LevelDbError::io_at("open native table", path, error))?;
+    let mut file = open_table_file(path, cache)?;
     let index_entries = read_native_index_entries(&mut file, path, paranoid_checks, cache)?;
     let mut requested = BTreeMap::<Vec<u8>, Vec<usize>>::new();
     for (index, key) in keys.iter().enumerate() {
         requested.entry(key.to_vec()).or_default().push(index);
     }
     let mut results = vec![None; keys.len()];
-    let mut seen_user_keys = BTreeSet::new();
 
-    for (index_key, handle_bytes) in index_entries {
-        let Some((largest_key, _)) = split_internal_key(&index_key) else {
+    for entry in index_entries.iter() {
+        let Some((largest_key, _)) = split_internal_key(entry.key.as_ref()) else {
             continue;
         };
         let Some(first_pending) = requested.keys().next() else {
@@ -1234,30 +1279,45 @@ fn get_native_table_entries_seeked(
         if largest_key < first_pending.as_slice() {
             continue;
         }
-        let mut handle_input = handle_bytes.as_ref();
+        let mut handle_input = entry.value.as_ref();
         let data_handle = read_block_handle(&mut handle_input)?;
         let data_block =
             read_native_block_from_file(&mut file, path, data_handle, paranoid_checks, cache)?;
-        for (internal_key, value) in decode_native_block_entries_bytes(&data_block)? {
-            let Some((user_key, is_value)) = split_internal_key(&internal_key) else {
-                continue;
+        decode_native_block_entry_ranges(data_block.as_ref(), |internal_key, value_range| {
+            let Some((user_key, is_value)) = split_internal_key(internal_key) else {
+                return Ok(VisitorControl::Continue);
             };
-            if !seen_user_keys.insert(user_key.to_vec()) {
-                continue;
+            discard_missing_requests_before(&mut requested, user_key);
+            if requested.is_empty() {
+                return Ok(VisitorControl::Stop);
             }
-            if is_value {
-                if let Some(indexes) = requested.remove(user_key) {
+            if let Some(indexes) = requested.remove(user_key) {
+                if is_value {
+                    let value = data_block.slice(value_range);
                     for index in indexes {
                         results[index] = Some(value.clone());
                     }
-                    if requested.is_empty() {
-                        return Ok(results);
-                    }
+                }
+                if requested.is_empty() {
+                    return Ok(VisitorControl::Stop);
                 }
             }
+            Ok(VisitorControl::Continue)
+        })?;
+        if requested.is_empty() {
+            return Ok(results);
         }
     }
     Ok(results)
+}
+
+fn discard_missing_requests_before(requested: &mut BTreeMap<Vec<u8>, Vec<usize>>, user_key: &[u8]) {
+    while requested
+        .first_key_value()
+        .is_some_and(|(pending_key, _)| pending_key.as_slice() < user_key)
+    {
+        requested.pop_first();
+    }
 }
 
 fn read_native_index_entries(
@@ -1265,7 +1325,15 @@ fn read_native_index_entries(
     path: &Path,
     paranoid_checks: bool,
     cache: Option<&NativeBlockCache>,
-) -> Result<Vec<(Vec<u8>, Bytes)>> {
+) -> Result<NativeIndexEntries> {
+    let cache_key = NativeIndexCacheKey {
+        path: path.to_path_buf(),
+        paranoid_checks,
+    };
+    if let Some(entries) = cache.and_then(|cache| cache.get_index(&cache_key)) {
+        return Ok(entries);
+    }
+
     let footer = read_native_footer(file, path)?;
     let magic_offset = LEVELDB_FOOTER_LEN - 8;
     let magic = u64::from_le_bytes(footer[magic_offset..].try_into().map_err(|_| {
@@ -1283,7 +1351,11 @@ fn read_native_index_entries(
     let index_handle = read_block_handle(&mut footer_input)?;
     let index_block =
         read_native_block_from_file(file, path, index_handle, paranoid_checks, cache)?;
-    decode_native_block_entries_bytes(&index_block)
+    let entries = decode_native_index_entries(&index_block)?;
+    if let Some(cache) = cache {
+        cache.insert_index(cache_key, Arc::clone(&entries));
+    }
+    Ok(entries)
 }
 
 fn read_native_index_entries_bytes(
@@ -1576,14 +1648,19 @@ fn read_native_block_from_file(
             )));
         }
     }
-    let block = Bytes::from(decompress_payload(compression, payload)?);
+    let block = if compression == COMPRESSION_NONE {
+        block.truncate(size);
+        Bytes::from(block)
+    } else {
+        Bytes::from(decompress_payload(compression, payload)?)
+    };
     if let Some(cache) = cache {
         cache.insert(cache_key, block.clone());
     }
     Ok(block)
 }
 
-fn decode_native_block_entries_bytes(block: &Bytes) -> Result<Vec<(Vec<u8>, Bytes)>> {
+fn native_block_entries_end(block: &[u8]) -> Result<usize> {
     if block.len() < 4 {
         return Err(LevelDbError::corruption(
             "native block is missing restart count".to_string(),
@@ -1604,10 +1681,37 @@ fn decode_native_block_entries_bytes(block: &Bytes) -> Result<Vec<(Vec<u8>, Byte
             "native block restart array is truncated".to_string(),
         ));
     }
-    let entries_end = restart_count_offset - restart_bytes;
+    Ok(restart_count_offset - restart_bytes)
+}
+
+fn decode_native_block_entries_bytes(block: &Bytes) -> Result<Vec<(Vec<u8>, Bytes)>> {
+    let mut entries = Vec::new();
+    decode_native_block_entry_ranges(block.as_ref(), |key, value_range| {
+        entries.push((key.to_vec(), block.slice(value_range)));
+        Ok(VisitorControl::Continue)
+    })?;
+    Ok(entries)
+}
+
+fn decode_native_index_entries(block: &Bytes) -> Result<NativeIndexEntries> {
+    let mut entries = Vec::new();
+    decode_native_block_entry_ranges(block.as_ref(), |key, value_range| {
+        entries.push(NativeIndexEntry {
+            key: Bytes::copy_from_slice(key),
+            value: block.slice(value_range),
+        });
+        Ok(VisitorControl::Continue)
+    })?;
+    Ok(entries.into())
+}
+
+fn decode_native_block_entry_ranges<F>(block: &[u8], mut visitor: F) -> Result<VisitorControl>
+where
+    F: FnMut(&[u8], Range<usize>) -> Result<VisitorControl>,
+{
+    let entries_end = native_block_entries_end(block)?;
     let mut input = &block[..entries_end];
     let mut key = Vec::new();
-    let mut entries = Vec::new();
     while !input.is_empty() {
         let shared = usize::try_from(get_varint32(&mut input)?).map_err(|_| {
             LevelDbError::corruption("native block shared key length overflow".to_string())
@@ -1635,12 +1739,22 @@ fn decode_native_block_entries_bytes(block: &Bytes) -> Result<Vec<(Vec<u8>, Byte
         let value_end = value_start.checked_add(value_len).ok_or_else(|| {
             LevelDbError::corruption("native block value range overflow".to_string())
         })?;
-        let value = block.slice(value_start..value_end);
         input = &input[value_len..];
-        entries.push((key.clone(), value));
+        if visitor(&key, value_start..value_end)? == VisitorControl::Stop {
+            return Ok(VisitorControl::Stop);
+        }
     }
 
-    Ok(entries)
+    Ok(VisitorControl::Continue)
+}
+
+fn is_next_user_key(previous: &mut Vec<u8>, user_key: &[u8]) -> bool {
+    if previous.as_slice() == user_key {
+        return false;
+    }
+    previous.clear();
+    previous.extend_from_slice(user_key);
+    true
 }
 
 fn collect_native_block_entries(block: &BlockValue<'_>) -> Result<Vec<(Vec<u8>, Bytes)>> {
@@ -1660,120 +1774,10 @@ where
     F: FnMut(&[u8], ValueRef<'_>) -> Result<VisitorControl>,
 {
     let block_bytes = block.as_bytes();
-    if block_bytes.len() < 4 {
-        return Err(LevelDbError::corruption(
-            "native block is missing restart count".to_string(),
-        ));
-    }
-    let restart_count_offset = block_bytes.len() - 4;
-    let restart_count = usize::try_from(u32::from_le_bytes(
-        block_bytes[restart_count_offset..]
-            .try_into()
-            .map_err(|_| {
-                LevelDbError::corruption("native block restart count is invalid".to_string())
-            })?,
-    ))
-    .map_err(|_| LevelDbError::corruption("native block restart count overflow".to_string()))?;
-    let restart_bytes = restart_count.checked_mul(4).ok_or_else(|| {
-        LevelDbError::corruption("native block restart array overflow".to_string())
-    })?;
-    if restart_bytes > restart_count_offset {
-        return Err(LevelDbError::corruption(
-            "native block restart array is truncated".to_string(),
-        ));
-    }
-    let entries_end = restart_count_offset - restart_bytes;
-    let mut input = &block_bytes[..entries_end];
-    let mut key = Vec::new();
-    while !input.is_empty() {
-        let shared = usize::try_from(get_varint32(&mut input)?).map_err(|_| {
-            LevelDbError::corruption("native block shared key length overflow".to_string())
-        })?;
-        let non_shared = usize::try_from(get_varint32(&mut input)?).map_err(|_| {
-            LevelDbError::corruption("native block key delta length overflow".to_string())
-        })?;
-        let value_len = usize::try_from(get_varint32(&mut input)?).map_err(|_| {
-            LevelDbError::corruption("native block value length overflow".to_string())
-        })?;
-        if shared > key.len() {
-            return Err(LevelDbError::corruption(
-                "native block shared prefix exceeds previous key".to_string(),
-            ));
-        }
-        if input.len() < non_shared.saturating_add(value_len) {
-            return Err(LevelDbError::corruption(
-                "native block entry is truncated".to_string(),
-            ));
-        }
-        key.truncate(shared);
-        key.extend_from_slice(&input[..non_shared]);
-        input = &input[non_shared..];
-        let value_start = entries_end.saturating_sub(input.len());
-        let value_end = value_start.checked_add(value_len).ok_or_else(|| {
-            LevelDbError::corruption("native block value range overflow".to_string())
-        })?;
-        let value = block.value_ref(&block_bytes[value_start..value_end])?;
-        input = &input[value_len..];
-        if visitor(&key, value)? == VisitorControl::Stop {
-            return Ok(VisitorControl::Stop);
-        }
-    }
-
-    Ok(VisitorControl::Continue)
-}
-
-fn decode_native_block_keys_bytes(block: &Bytes) -> Result<Vec<(Vec<u8>, usize)>> {
-    if block.len() < 4 {
-        return Err(LevelDbError::corruption(
-            "native block is missing restart count".to_string(),
-        ));
-    }
-    let restart_count_offset = block.len() - 4;
-    let restart_count = usize::try_from(u32::from_le_bytes(
-        block[restart_count_offset..].try_into().map_err(|_| {
-            LevelDbError::corruption("native block restart count is invalid".to_string())
-        })?,
-    ))
-    .map_err(|_| LevelDbError::corruption("native block restart count overflow".to_string()))?;
-    let restart_bytes = restart_count.checked_mul(4).ok_or_else(|| {
-        LevelDbError::corruption("native block restart array overflow".to_string())
-    })?;
-    if restart_bytes > restart_count_offset {
-        return Err(LevelDbError::corruption(
-            "native block restart array is truncated".to_string(),
-        ));
-    }
-    let entries_end = restart_count_offset - restart_bytes;
-    let mut input = &block[..entries_end];
-    let mut key = Vec::new();
-    let mut entries = Vec::new();
-    while !input.is_empty() {
-        let shared = usize::try_from(get_varint32(&mut input)?).map_err(|_| {
-            LevelDbError::corruption("native block shared key length overflow".to_string())
-        })?;
-        let non_shared = usize::try_from(get_varint32(&mut input)?).map_err(|_| {
-            LevelDbError::corruption("native block key delta length overflow".to_string())
-        })?;
-        let value_len = usize::try_from(get_varint32(&mut input)?).map_err(|_| {
-            LevelDbError::corruption("native block value length overflow".to_string())
-        })?;
-        if shared > key.len() {
-            return Err(LevelDbError::corruption(
-                "native block shared prefix exceeds previous key".to_string(),
-            ));
-        }
-        if input.len() < non_shared.saturating_add(value_len) {
-            return Err(LevelDbError::corruption(
-                "native block entry is truncated".to_string(),
-            ));
-        }
-        key.truncate(shared);
-        key.extend_from_slice(&input[..non_shared]);
-        input = &input[non_shared + value_len..];
-        entries.push((key.clone(), value_len));
-    }
-
-    Ok(entries)
+    decode_native_block_entry_ranges(block_bytes, |key, value_range| {
+        let value = block.value_ref(&block_bytes[value_range])?;
+        visitor(key, value)
+    })
 }
 
 const fn mark_table_scanned(mut outcome: ScanOutcome) -> ScanOutcome {
@@ -1802,6 +1806,24 @@ fn internal_key(user_key: &[u8], sequence: u64, value_type: u8) -> Vec<u8> {
     key.extend_from_slice(user_key);
     key.extend_from_slice(&((sequence << 8) | u64::from(value_type)).to_le_bytes());
     key
+}
+
+fn native_block_entry_len(key: &[u8], value: &[u8]) -> usize {
+    native_varint_len(key.len())
+        .saturating_add(native_varint_len(value.len()))
+        .saturating_add(1)
+        .saturating_add(key.len())
+        .saturating_add(value.len())
+        .saturating_add(4)
+}
+
+fn native_varint_len(mut value: usize) -> usize {
+    let mut len = 1_usize;
+    while value >= 0x80 {
+        len = len.saturating_add(1);
+        value >>= 7;
+    }
+    len
 }
 
 fn encode_native_block(entries: &[(Vec<u8>, Bytes)]) -> Result<Vec<u8>> {
@@ -1989,15 +2011,19 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn table_roundtrips_without_compression() {
-        let path = std::env::temp_dir().join(format!(
-            "bedrock-leveldb-table-{}.ldb",
+    fn temp_table_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bedrock-leveldb-{name}-{}.ldb",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time")
                 .as_nanos()
-        ));
+        ))
+    }
+
+    #[test]
+    fn table_roundtrips_without_compression() {
+        let path = temp_table_path("table");
         let mut entries = BTreeMap::new();
         entries.insert(b"a".to_vec(), Bytes::from_static(b"one"));
         entries.insert(b"b".to_vec(), Bytes::from_static(b"two"));
@@ -2005,6 +2031,61 @@ mod tests {
         write_table(&path, &entries, CompressionPolicy::None).expect("write");
         let decoded = read_table(&path, true).expect("read");
         assert_eq!(decoded, entries);
+        std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn custom_table_key_scan_rejects_truncated_header_without_panic() {
+        let path = temp_table_path("truncated-custom-table");
+        std::fs::write(&path, TABLE_MAGIC).expect("write truncated custom table");
+
+        let result = for_each_table_key(&path, true, None, |_| Ok(VisitorControl::Continue));
+
+        assert!(
+            matches!(result, Err(LevelDbError::Corruption { .. })),
+            "expected corruption error, got {result:?}"
+        );
+        std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn cached_table_opens_keep_seek_positions_independent() {
+        let path = temp_table_path("independent-seek-positions");
+        std::fs::write(&path, b"0123456789").expect("write table bytes");
+        let cache = NativeBlockCache::new(1024);
+        let mut first = cache.open_table_file(&path).expect("open first handle");
+        let mut second = cache.open_table_file(&path).expect("open second handle");
+
+        first.seek(SeekFrom::Start(1)).expect("seek first handle");
+        second.seek(SeekFrom::Start(4)).expect("seek second handle");
+        let mut byte = [0_u8; 1];
+        first.read_exact(&mut byte).expect("read first handle");
+
+        assert_eq!(byte, [b'1']);
+        std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn native_writer_splits_large_tables_into_indexed_data_blocks() {
+        let path = temp_table_path("multi-block-native");
+        let mut entries = BTreeMap::new();
+        for index in 0..256 {
+            entries.insert(
+                format!("key:{index:04}").into_bytes(),
+                Bytes::from(vec![u8::try_from(index).expect("small index"); 512]),
+            );
+        }
+
+        write_native_table(&path, &entries, 7, CompressionPolicy::None).expect("write native");
+        let bytes = std::fs::read(&path).expect("read native table");
+        let index_entries = read_native_index_entries_bytes(&path, &bytes, true)
+            .expect("read native index entries");
+
+        assert!(index_entries.len() > 1);
+        assert_eq!(
+            get_table_entry(&path, b"key:0192", true, None).expect("point get"),
+            Some(Bytes::from(vec![192_u8; 512]))
+        );
         std::fs::remove_file(path).expect("cleanup");
     }
 }

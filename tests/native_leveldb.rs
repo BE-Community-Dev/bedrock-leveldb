@@ -54,6 +54,20 @@ fn native_table_point_prefix_and_deletion_records_are_read() {
         Some(Bytes::from_static(b"one"))
     );
     assert_eq!(db.get(b"gone").expect("get gone"), None);
+    let batch_values = db
+        .get_many_owned(
+            vec![
+                Bytes::from_static(b"aardvark"),
+                Bytes::from_static(b"gone"),
+                Bytes::from_static(b"alpha"),
+            ],
+            ReadOptions::default(),
+        )
+        .expect("get many with tombstone");
+    assert_eq!(
+        batch_values,
+        vec![None, None, Some(Bytes::from_static(b"one"))]
+    );
 
     let mut prefix_values = Vec::new();
     db.for_each_prefix(b"player_", ReadOptions::default(), |key, value| {
