@@ -198,7 +198,7 @@ impl NativeBlockCache {
         }
     }
 
-    fn open_table_file(&self, path: &Path) -> Result<File> {
+    fn open_table_file(path: &Path) -> Result<File> {
         // `File::try_clone` duplicates an OS handle but shares its seek cursor. Table reads
         // seek before every block, so cached clones corrupt concurrent reads.
         open_table_file_uncached(path)
@@ -890,8 +890,8 @@ fn read_custom_table_bytes(
 }
 
 fn open_table_file(path: &Path, cache: Option<&NativeBlockCache>) -> Result<File> {
-    if let Some(cache) = cache {
-        cache.open_table_file(path)
+    if cache.is_some() {
+        NativeBlockCache::open_table_file(path)
     } else {
         open_table_file_uncached(path)
     }
@@ -1002,7 +1002,7 @@ where
             read_native_block_from_file(&mut file, path, data_handle, paranoid_checks, cache)?;
         let stopped =
             decode_native_block_entry_ranges(&data_block, |internal_key, value_range| {
-                let Some((user_key, is_value)) = split_internal_key(&internal_key) else {
+                let Some((user_key, is_value)) = split_internal_key(internal_key) else {
                     return Ok(VisitorControl::Continue);
                 };
                 if !is_next_user_key(&mut previous_user_key, user_key) {
@@ -1100,7 +1100,7 @@ where
         let mut reached_prefix_end = false;
         let stopped =
             decode_native_block_entry_ranges(&data_block, |internal_key, value_range| {
-                let Some((user_key, is_value)) = split_internal_key(&internal_key) else {
+                let Some((user_key, is_value)) = split_internal_key(internal_key) else {
                     return Ok(VisitorControl::Continue);
                 };
                 if !is_next_user_key(&mut previous_user_key, user_key) {
@@ -2052,9 +2052,8 @@ mod tests {
     fn cached_table_opens_keep_seek_positions_independent() {
         let path = temp_table_path("independent-seek-positions");
         std::fs::write(&path, b"0123456789").expect("write table bytes");
-        let cache = NativeBlockCache::new(1024);
-        let mut first = cache.open_table_file(&path).expect("open first handle");
-        let mut second = cache.open_table_file(&path).expect("open second handle");
+        let mut first = NativeBlockCache::open_table_file(&path).expect("open first handle");
+        let mut second = NativeBlockCache::open_table_file(&path).expect("open second handle");
 
         first.seek(SeekFrom::Start(1)).expect("seek first handle");
         second.seek(SeekFrom::Start(4)).expect("seek second handle");

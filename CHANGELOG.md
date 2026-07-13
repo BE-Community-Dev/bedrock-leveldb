@@ -2,6 +2,13 @@
 
 All notable changes to `bedrock-leveldb` are tracked here.
 
+## 0.3.1 - 2026-07-14
+
+### Fixed
+
+- Fixed native-table reader lint failures that blocked the `0.3.0` publish
+  workflow.
+
 ## 0.3.0 - 2026-07-14
 
 ### Changed
